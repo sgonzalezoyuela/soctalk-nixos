@@ -313,11 +313,29 @@ in
       }
     ];
 
-    # K3s manifests: always the HelmChart; conditionally the Ingress
-    # and Certificate. mkMerge keeps all three under a single
-    # services.k3s.manifests definition.
+    # K3s manifests: always the Namespace + HelmChart; conditionally
+    # the Ingress and Certificate. mkMerge keeps all four under a
+    # single services.k3s.manifests definition.
     services.k3s.manifests = lib.mkMerge [
       {
+        # 0. Namespace. Rendered explicitly (alphabetically before
+        # `oauth2-proxy`) so it exists as soon as K3s starts applying
+        # static manifests. This lets `oauth2-proxy-secrets.service`
+        # apply the Secret BEFORE helm-controller spins up the
+        # OAuth2-Proxy deployment — eliminating the race where the
+        # Pod would otherwise CrashLoopBackOff with
+        # `secret "oauth2-proxy-secrets" not found` until the Secret
+        # eventually appears.
+        #
+        # `createNamespace: true` on the HelmChart below stays, as
+        # belt-and-suspenders: if someone disables this manifest,
+        # the chart still creates its own namespace.
+        oauth2-proxy-namespace.content = {
+          apiVersion = "v1";
+          kind = "Namespace";
+          metadata = { name = cfg.namespace; };
+        };
+
         # 1. OAuth2-Proxy HelmChart.
         oauth2-proxy.content = {
           apiVersion = "helm.cattle.io/v1";

@@ -720,6 +720,40 @@ verbatim over the derived default. Use it for:
 
 Three files on the target machine, one Kubernetes Secret. The chart's `config.existingSecret` is wired automatically to `secretsPath.secretName` (default `oauth2-proxy-secrets`). Key names inside the Secret match the chart's expectations: `client-id`, `client-secret`, `cookie-secret`.
 
+**All three files are required.** The systemd loader pre-flight check (`[ -s "$f" ]`) fails the unit if any file is missing or empty. Common failure: consumer stages `client-id` and `client-secret` (which come from the IdP) but forgets to generate `cookie-secret` (which is local-only — `openssl rand -base64 32 | tr -d '\n' > /var/lib/oauth2-proxy/cookie-secret`). See "Diagnostic procedure" below.
+
+### Race window: Pod startup vs Secret apply
+
+OAuth2-Proxy's Deployment Pod consumes the credentials Secret at *startup* (via the chart's `config.existingSecret` → `envFrom.secretRef`). If the Pod is scheduled before the systemd loader has applied the Secret, kubelet logs `Error: secret "oauth2-proxy-secrets" not found` and the Pod enters CrashLoopBackOff. **This is normally self-healing** — the Pod's next retry (within ~30s–5min depending on backoff stage) succeeds once the Secret exists.
+
+To tighten the race window, `modules/oidc.nix` writes an **explicit Namespace manifest** (`oauth2-proxy-namespace`, sorted alphabetically before `oauth2-proxy.yaml`). This lets the systemd loader apply the Secret as soon as K3s API is ready, without waiting for helm-controller to run `helm install --create-namespace`. `modules/cert-manager.nix` does the same for the `cert-manager` namespace (less critical there — cert-manager's pods don't startup-depend on the CA Secret).
+
+The HelmChart's `createNamespace: true` is **retained** in both modules as belt-and-suspenders: if anyone disables the explicit Namespace, the chart still works.
+
+### Diagnostic procedure when the OIDC Pod is stuck
+
+```bash
+# 1. Pod-level: confirm the error is the missing Secret (not e.g. image pull).
+kubectl -n ingress-system describe pod -l app.kubernetes.io/name=oauth2-proxy \
+  | grep -E 'Error|secret|Failed'
+
+# 2. Cluster-level: does the Secret exist?
+kubectl -n ingress-system get secret oauth2-proxy-secrets
+
+# 3. Loader-level: did the systemd one-shot run?
+systemctl status oauth2-proxy-secrets.service
+journalctl -u oauth2-proxy-secrets.service -n 50
+
+# 4. File-level: are all THREE credentials staged?
+ls -lah /var/lib/cert-manager/ /var/lib/oauth2-proxy/
+# Expect: ca.{crt,key} for cert-manager;
+# client-id + client-secret + cookie-secret for oauth2-proxy.
+# Missing cookie-secret is the most common slip — generate it locally:
+#   openssl rand -base64 32 | tr -d '\n' > /var/lib/oauth2-proxy/cookie-secret
+#   chmod 0400 /var/lib/oauth2-proxy/cookie-secret
+#   systemctl restart oauth2-proxy-secrets.service
+```
+
 **Critical invariant (shared with §15):** the bytes never enter the
 `/nix/store`. The module declares only file *paths*. The loader
 reads files at boot, pipes through `kubectl create --dry-run=client
@@ -832,7 +866,8 @@ After bumping:
 | Default `letsencrypt.solver.http01.ingressClass = "traefik"` mismatched with an installed `nginx` controller | ACME solver Ingress is ignored | Set the option to the actually-installed class name |
 | Enabling `oidc.tls.enable` without `clusterIssuer.enable` and without setting `tls.issuerRef` | Eval-time assertion fires (see §16) | Either enable `certManager.clusterIssuer` or set `oidc.tls.issuerRef` explicitly |
 | Setting `oidc.version` to the OAuth2-Proxy **app** version (e.g. `7.15.2`) instead of the **chart** version (e.g. `10.4.3`) | `helm-install-oauth2-proxy-*` Job CrashLoopBackOff with `Error: INSTALLATION FAILED: chart "oauth2-proxy" matching 7.15.2 not found in oauth2-proxy index` | Always use a chart version from https://oauth2-proxy.github.io/manifests/index.yaml; pick one whose `appVersion` matches the OAuth2-Proxy release you want. The two have separate version trains. |
-| Enabling `oidc.enable` without staging `/var/lib/oauth2-proxy/{client-id,client-secret,cookie-secret}` | `oauth2-proxy-secrets.service` fails with "required file missing or empty"; OAuth2-Proxy CrashLoopBackOff (chart can't reference the Secret) | Stage all three files via `--extra-files` / scp / agenix / sops-nix before deploy |
+| Enabling `oidc.enable` without staging `/var/lib/oauth2-proxy/{client-id,client-secret,cookie-secret}` | `oauth2-proxy-secrets.service` fails with "required file missing or empty"; OAuth2-Proxy CrashLoopBackOff with `Error: secret "oauth2-proxy-secrets" not found` | Stage all three files via `--extra-files` / scp / agenix / sops-nix before deploy. See §16 "Diagnostic procedure" |
+| Staging `client-id` + `client-secret` but forgetting `cookie-secret` | Same symptom: loader fails, Pod CrashLoopBackOff. **Most common variant** — the IdP gives you the first two but `cookie-secret` is consumer-generated and easy to forget | `openssl rand -base64 32 \| tr -d '\n' > /var/lib/oauth2-proxy/cookie-secret && systemctl restart oauth2-proxy-secrets.service` |
 | Default `oidc.ingress.className = "traefik"` mismatched with an installed `nginx` controller | `/oauth2/*` requests 404 — no controller picks up the Ingress | Set `oidc.ingress.className = "nginx"` (and consider aligning `letsencrypt.solver.http01.ingressClass` too) |
 | `oidc.host` mismatched with the IdP's registered redirect URI | OIDC callback fails after login with "invalid redirect_uri" | Either fix `oidc.host` / `oidc.redirectUrl` to match what's registered, or update the IdP client's authorized redirect URIs |
 | Setting `i18n.defaultLocale` in `modules/base.nix` | "conflicting definitions" with `modules/tenant.nix` | Only `modules/tenant.nix` sets it |

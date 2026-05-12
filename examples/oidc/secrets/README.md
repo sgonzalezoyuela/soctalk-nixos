@@ -31,9 +31,13 @@ intermediate to the cluster.
 OAuth2-Proxy requires a 32-byte base64-encoded random value:
 
 ```bash
-openssl rand -base64 32 > cookie-secret
+openssl rand -base64 32 | tr -d '\n' > cookie-secret
 chmod 0400 cookie-secret
 ```
+
+The `tr -d '\n'` strips the trailing newline that `openssl` appends —
+without it, OAuth2-Proxy rejects the cookie secret as "not exactly
+32 bytes" because the trailing `\n` makes the decoded value 33 bytes.
 
 The cookie secret is cluster-local — never visible to clients. Rotate
 it during incident response; existing sessions are invalidated.

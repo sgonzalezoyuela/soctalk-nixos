@@ -246,11 +246,22 @@ in
       }
     ];
 
-    # K3s manifests: always cert-manager; conditionally ClusterIssuer.
-    # mkMerge keeps both definitions of services.k3s.manifests inside a
-    # single config block.
+    # K3s manifests: always Namespace + cert-manager; conditionally
+    # ClusterIssuer. mkMerge keeps all three under a single config
+    # block.
     services.k3s.manifests = lib.mkMerge [
       {
+        # 0. Namespace. Rendered explicitly (alphabetically before
+        # `cert-manager`) so it exists as soon as K3s applies static
+        # manifests. Lets `cert-manager-ca-secret.service` (when
+        # caSecret.enable is true) apply the CA Secret without
+        # waiting for helm-controller's createNamespace step.
+        cert-manager-namespace.content = {
+          apiVersion = "v1";
+          kind = "Namespace";
+          metadata = { name = cfg.namespace; };
+        };
+
         # 1. cert-manager itself. Standard (non-bootstrap) HelmChart.
         cert-manager.content = {
           apiVersion = "helm.cattle.io/v1";

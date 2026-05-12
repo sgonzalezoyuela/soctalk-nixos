@@ -190,10 +190,10 @@ the bytes never enter `/nix/store`. Stage them via
 `nixos-anywhere --extra-files`, `scp`, or `agenix` / `sops-nix`
 (see [`examples/oidc/secrets/README.md`](./examples/oidc/secrets/README.md)).
 
-Generate the cookie-secret:
+Generate the cookie-secret (the `tr -d '\n'` is required — OAuth2-Proxy rejects values that aren't exactly 32 raw bytes, and `openssl` appends a trailing newline):
 
 ```bash
-openssl rand -base64 32 > cookie-secret
+openssl rand -base64 32 | tr -d '\n' > cookie-secret
 ```
 
 Then protect any app's Ingress with the auth-url annotations. For
