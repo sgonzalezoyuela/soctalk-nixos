@@ -1,0 +1,162 @@
+# `secrets/` — tenant CA + OIDC credentials
+
+This directory holds **two sets** of tenant-specific secrets,
+referenced by paths only (the flake never calls
+`builtins.readFile` on anything in here — bytes are not in the Nix
+store).
+
+| Set | Files | Loaded by |
+|---|---|---|
+| Internal CA (for cert-manager `ca` ClusterIssuer) | `ca.crt`, `ca.key` | `cert-manager-ca-secret.service` on the target, from `/var/lib/cert-manager/ca.{crt,key}` |
+| OIDC client (for OAuth2-Proxy) | `client-id`, `client-secret`, `cookie-secret` | `oauth2-proxy-secrets.service` on the target, from `/var/lib/oauth2-proxy/{client-id,client-secret,cookie-secret}` |
+
+Only `.gitignore` and `README.md` are tracked. Everything else is
+ignored.
+
+## 1. Generate the internal CA (lab / dev)
+
+```bash
+openssl genrsa -out ca.key 4096
+openssl req -x509 -new -nodes -key ca.key -sha256 -days 3650 \
+  -subj "/CN=Example Internal CA" -out ca.crt
+chmod 0400 ca.key
+```
+
+For production, mint the CA in an offline ceremony and store the
+private key in an HSM / vault. Only export the operational
+intermediate to the cluster.
+
+## 2. Generate the OIDC cookie secret
+
+OAuth2-Proxy requires a 32-byte base64-encoded random value:
+
+```bash
+openssl rand -base64 32 > cookie-secret
+chmod 0400 cookie-secret
+```
+
+The cookie secret is cluster-local — never visible to clients. Rotate
+it during incident response; existing sessions are invalidated.
+
+## 3. Register an OIDC client with your IdP
+
+This step depends on your IdP (Keycloak, Authentik, Auth0, Okta,
+Dex, …). General requirements:
+
+- **Client type**: confidential (server-side; we hold the secret).
+- **Authorized redirect URI**: `https://edge-01.example.org/oauth2/callback`
+  (or whatever `oidc.host` / `oidc.redirectUrl` resolves to — see
+  the example's `flake.nix`).
+- **Token endpoint auth method**: `client_secret_basic` or
+  `client_secret_post` (OAuth2-Proxy supports both).
+- **Scopes**: at minimum `openid`. Add `profile`, `email`, `groups`
+  to populate the corresponding `X-Auth-Request-*` headers
+  downstream apps receive.
+
+Save the returned client ID and client secret as:
+
+```bash
+printf '%s' '<your-client-id>'      > client-id
+printf '%s' '<your-client-secret>'  > client-secret
+chmod 0400 client-id client-secret
+```
+
+(`printf '%s'` without `\n` keeps the file body the exact value, no
+trailing newline — important for the kubectl `--from-file` mapping.)
+
+## 4. Stage onto the target
+
+### Option A — `nixos-anywhere --extra-files` (fresh, destructive)
+
+```bash
+mkdir -p extra-files/var/lib/cert-manager extra-files/var/lib/oauth2-proxy
+cp secrets/ca.crt        extra-files/var/lib/cert-manager/ca.crt
+cp secrets/ca.key        extra-files/var/lib/cert-manager/ca.key
+cp secrets/client-id     extra-files/var/lib/oauth2-proxy/client-id
+cp secrets/client-secret extra-files/var/lib/oauth2-proxy/client-secret
+cp secrets/cookie-secret extra-files/var/lib/oauth2-proxy/cookie-secret
+chmod 0400 extra-files/var/lib/cert-manager/ca.key \
+           extra-files/var/lib/oauth2-proxy/*
+
+nix run github:nix-community/nixos-anywhere -- \
+  --extra-files ./extra-files \
+  --flake .#edge-01 \
+  root@<ip>
+```
+
+`systemd-tmpfiles` rules enforce `0400 root:root` on all credential
+files at boot regardless of how they arrived.
+
+### Option B — `scp` + `nixos-rebuild` (incremental)
+
+```bash
+TARGET=root@<ip>
+
+ssh $TARGET 'install -d -m 0700 /var/lib/cert-manager /var/lib/oauth2-proxy'
+
+scp secrets/ca.crt        $TARGET:/var/lib/cert-manager/ca.crt
+scp secrets/ca.key        $TARGET:/var/lib/cert-manager/ca.key
+scp secrets/client-id     $TARGET:/var/lib/oauth2-proxy/client-id
+scp secrets/client-secret $TARGET:/var/lib/oauth2-proxy/client-secret
+scp secrets/cookie-secret $TARGET:/var/lib/oauth2-proxy/cookie-secret
+
+ssh $TARGET 'chmod 0400 /var/lib/cert-manager/ca.key /var/lib/oauth2-proxy/*'
+
+nixos-rebuild switch --flake .#edge-01 --target-host $TARGET
+ssh $TARGET 'systemctl restart cert-manager-ca-secret.service oauth2-proxy-secrets.service'
+```
+
+### Option C — `agenix` / `sops-nix` (production, recommended)
+
+Encrypt the files at rest in this repo and decrypt them to a
+`tmpfs`-backed path on the target at boot. Point the loader options
+at the runtime paths:
+
+```nix
+certManager.caSecret = {
+  certPath = "/run/agenix/cert-manager-ca.crt";
+  keyPath  = "/run/agenix/cert-manager-ca.key";
+};
+oidc.secretsPath = {
+  clientId     = "/run/agenix/oauth2-proxy-client-id";
+  clientSecret = "/run/agenix/oauth2-proxy-client-secret";
+  cookieSecret = "/run/agenix/oauth2-proxy-cookie-secret";
+};
+```
+
+The same loaders work without modification — they only ever consume
+the paths.
+
+## 5. Verify
+
+```bash
+ssh ops@edge-01.example.org
+
+# Both loaders ran cleanly:
+systemctl status cert-manager-ca-secret.service
+systemctl status oauth2-proxy-secrets.service
+
+# Secrets in the cluster:
+kubectl -n cert-manager   get secret ca-key-pair
+kubectl -n ingress-system get secret oauth2-proxy-secrets
+
+# cert-manager + cert minted for the OIDC host:
+kubectl get clusterissuer internal-ca
+kubectl -n ingress-system get certificate oauth2-proxy-tls
+kubectl -n ingress-system get secret      oauth2-proxy-tls   # the minted TLS Secret
+
+# OAuth2-Proxy + Ingress:
+kubectl -n ingress-system get pods    -l app.kubernetes.io/name=oauth2-proxy
+kubectl -n ingress-system get ingress oauth2-proxy
+
+# Try the auth flow:
+curl -kI https://edge-01.example.org/oauth2/start    # expect 302 → IdP
+```
+
+## 6. Rotating
+
+| Rotating | Procedure |
+|---|---|
+| CA | Replace `ca.crt`+`ca.key`, restage, `systemctl restart cert-manager-ca-secret.service`. New leaf certs use the new CA; existing ones valid until expiry. |
+| OIDC client secret | Update at IdP, replace `client-secret` here, restage, `systemctl restart oauth2-proxy-secrets.service`, then `kubectl -n ingress-system rollout restart deploy/oauth2-proxy` so OAuth2-Proxy reloads. |
+| Cookie secret | Replace `cookie-secret`, restage, restart `oauth2-proxy-secrets.service` + roll the OAuth2-Proxy deployment. **All existing sessions invalidated.** |

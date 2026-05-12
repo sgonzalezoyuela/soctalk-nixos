@@ -33,7 +33,7 @@
 
   outputs = { self, nixpkgs, soctalk-nixos, ... }: {
     nixosConfigurations.edge-01 = soctalk-nixos.lib.mkHost {
-      hostName = "edge-01";
+      hostName = "soctalk";
       tenant = {
         timeZone = "Europe/Madrid";
         locale = "es_ES.UTF-8";

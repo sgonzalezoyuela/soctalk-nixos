@@ -28,6 +28,12 @@ configuration was validated end-to-end.
   ClusterIssuer (selfSigned / ca / letsencryptStaging / letsencryptProd)
   and an on-target CA Secret loader (`certManager.caSecret.*`) — see
   the option table below.
+- **Optional OAuth2-Proxy (OIDC) frontend** at
+  `https://<hostName>.<domain>/oauth2/*` — installed when
+  `oidc.enable = true`, with credentials loaded from on-target files
+  (never `/nix/store`), an Ingress for the `/oauth2/*` paths, and
+  optional cert-manager-minted TLS. Apps protect themselves with
+  ingress auth-url annotations.
 - kubectl + kubernetes-helm + kubecolor + k9s + cilium-cli + hubble + cmctl
   on the host
 - System-wide `k = kubecolor` alias with kubectl completion bound to
@@ -118,6 +124,25 @@ All knobs live under `soctalk.tenant.*`. Full schema in
 | `certManager.caSecret.name` | str | `ca-key-pair` | Kubernetes Secret name |
 | `certManager.caSecret.certPath` | str | `/var/lib/cert-manager/ca.crt` | path on target |
 | `certManager.caSecret.keyPath` | str | `/var/lib/cert-manager/ca.key` | path on target |
+| `oidc.enable` | bool | `false` | opt in to OAuth2-Proxy stack |
+| `oidc.version` | str | `7.15.2` | oauth2-proxy chart version |
+| `oidc.namespace` | str | `ingress-system` | install namespace |
+| `oidc.releaseName` | str | `oauth2-proxy` | Helm release + Service name |
+| `oidc.host` | str | derived `${hostName}.${domain}` | OAuth2-Proxy public hostname |
+| `oidc.redirectUrl` | nullOr str | `null` | override derived `https://<host>/oauth2/callback`; for localhost / split-horizon |
+| `oidc.issuerUrl` | nullOr str | `null` | required when `oidc.enable` |
+| `oidc.provider` | str | `oidc` | `oidc` / `google` / `keycloak-oidc` / … |
+| `oidc.upstream` | str | `static://202` | auth-url-only mode by default |
+| `oidc.cookieDomain` | str | `oidc.host` | cookie scope |
+| `oidc.extraArgs` | attrs | `{}` | extra OAuth2-Proxy CLI flags; merged after defaults |
+| `oidc.secretsPath.{clientId,clientSecret,cookieSecret}` | str | `/var/lib/oauth2-proxy/...` | on-target paths read by the loader |
+| `oidc.secretsPath.secretName` | str | `oauth2-proxy-secrets` | k8s Secret name |
+| `oidc.ingress.enable` | bool | `true` | render `/oauth2/*` Ingress |
+| `oidc.ingress.className` | str | `traefik` | must match installed ingress controller |
+| `oidc.ingress.path` | str | `/oauth2` | Ingress path prefix |
+| `oidc.tls.enable` | bool | `false` | render cert-manager Certificate + Ingress TLS block |
+| `oidc.tls.secretName` | str | `oauth2-proxy-tls` | TLS Secret |
+| `oidc.tls.issuerRef` | nullOr str | `clusterIssuer.name` when enabled, else `null` | ClusterIssuer the Certificate references |
 
 Per-LC overrides and one-off `networking.*` tweaks still work — set
 them directly via `extraModules`, module merging picks them up over
@@ -141,6 +166,67 @@ helm install traefik traefik/traefik -n ingress-system --create-namespace
 helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
 helm install ingress-nginx ingress-nginx/ingress-nginx -n ingress-system --create-namespace
 ```
+
+### OIDC frontend (OAuth2-Proxy)
+
+`soctalk-nixos` does not implement login. When `oidc.enable = true`,
+the bundle installs **OAuth2-Proxy** to terminate OIDC and forward
+trusted identity headers; apps protect themselves with ingress
+auth-url annotations.
+
+Default behaviour:
+
+- `oidc.host` derives to `${networking.hostName}.${networking.domain}`.
+- `redirect-url` derives to `https://<host>/oauth2/callback`. Override via `oidc.redirectUrl` for localhost / split-horizon.
+- An Ingress for `/oauth2/*` is rendered (`oidc.ingress.enable = true` by default), targeting `ingress.className` (default `traefik`).
+- `tls.enable = false` by default — flip it on (and ensure
+  `clusterIssuer.enable = true` or set `tls.issuerRef` directly) to
+  get a cert-manager-minted TLS Secret wired into the Ingress.
+
+Credentials (`client-id`, `client-secret`, `cookie-secret`) are
+loaded by `oauth2-proxy-secrets.service` at boot from
+`/var/lib/oauth2-proxy/{client-id,client-secret,cookie-secret}` —
+the bytes never enter `/nix/store`. Stage them via
+`nixos-anywhere --extra-files`, `scp`, or `agenix` / `sops-nix`
+(see [`examples/oidc/secrets/README.md`](./examples/oidc/secrets/README.md)).
+
+Generate the cookie-secret:
+
+```bash
+openssl rand -base64 32 > cookie-secret
+```
+
+Then protect any app's Ingress with the auth-url annotations. For
+**ingress-nginx**:
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/auth-url:     "https://$host/oauth2/auth"
+    nginx.ingress.kubernetes.io/auth-signin:  "https://$host/oauth2/start?rd=$escaped_request_uri"
+    nginx.ingress.kubernetes.io/auth-response-headers: X-Auth-Request-User, X-Auth-Request-Email, X-Auth-Request-Groups
+```
+
+For **Traefik v3**, declare a `Middleware`:
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata: { name: oauth2-proxy-forward-auth, namespace: <your-ns> }
+spec:
+  forwardAuth:
+    address: http://oauth2-proxy.ingress-system.svc.cluster.local:80/oauth2/auth
+    trustForwardHeader: true
+    authResponseHeaders:
+      - X-Auth-Request-User
+      - X-Auth-Request-Email
+      - X-Auth-Request-Groups
+```
+
+Then reference the Middleware on the protected app's Ingress via
+`traefik.ingress.kubernetes.io/router.middlewares`.
+
+See [`examples/oidc/`](./examples/oidc) for the full end-to-end flake.
 
 ### CA materials for `type = "ca"`
 
@@ -320,6 +406,7 @@ modules/
   users.nix                     creates users from tenant options
   k3s.nix                       K3s + Cilium manifest + firewall
   cert-manager.nix              cert-manager HelmChart + ClusterIssuer + CA Secret loader
+  oidc.nix                      OAuth2-Proxy HelmChart + Ingress + cert-manager Certificate + Secret loader
   kubectl-tooling.nix           CLI tools (kubectl + helm + k9s + cilium-cli + hubble + cmctl) + KUBECONFIG + k alias
   platforms/
     proxmox.nix                 qemu-guest, virtio, GRUB BIOS
@@ -341,6 +428,8 @@ examples/
   static-network/               full tenant override + cert-manager CA ClusterIssuer + caSecret loader
     secrets/                    .gitignore + README; consumer-supplied ca.{crt,key} live here
   dhcp/                         tenant with DHCP
+  oidc/                         full stack: cert-manager + ClusterIssuer + OAuth2-Proxy + Ingress + TLS
+    secrets/                    .gitignore + README; ca + client-id/secret + cookie-secret live here
 
 scripts/
   deploy.sh                     wrapper for `nix run .#deploy`

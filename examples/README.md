@@ -10,8 +10,9 @@ directory will type-check it against the real module schema.
 | Example | What it demonstrates |
 |---|---|
 | [`minimal/`](./minimal) | Smallest possible consumer flake: only the required network fields, everything else defaulted (UTC, en_US.UTF-8, in-repo admin users + SSH keys, /dev/sda, ens18). |
-| [`static-network/`](./static-network) | Full tenant override: timezone, locale, disk device, admin user, SSH key, static IP/prefix/gateway/DNS/domain. The "this is how you really configure a host" example. |
+| [`static-network/`](./static-network) | Full tenant override: timezone, locale, static IP, DNS, gw, admin user, SSH key, plus a cert-manager `ca` ClusterIssuer with the CA loaded from on-target files. The "this is how you really configure a host" example. |
 | [`dhcp/`](./dhcp) | `network.useDHCP = true` — no static IP/gateway needed, the tenant-level assertion lets DHCP through. |
+| [`oidc/`](./oidc) | End-to-end auth stack: cert-manager + CA ClusterIssuer + OAuth2-Proxy + Ingress + cert-manager-minted TLS for the OIDC host. Demonstrates the host-derivation pattern (`oidc.host = "${hostName}.${domain}"`), the `redirectUrl` override, and the canonical ingress-nginx / Traefik auth-url annotation patterns. |
 
 ## Local vs github inputs
 

@@ -72,6 +72,7 @@ modules/
   users.nix             reads tenant.adminUsers / tenant.sshAuthorizedKeys
   k3s.nix               K3s server + declarative Cilium HelmChart + firewall
   cert-manager.nix      cert-manager HelmChart + optional ClusterIssuer + optional CA Secret loader
+  oidc.nix              OAuth2-Proxy HelmChart + optional Ingress + optional cert-manager Certificate + Secret loader
   kubectl-tooling.nix   kubectl + helm + k9s + cilium-cli + hubble + cmctl + completions
   platforms/
     proxmox.nix         qemu-guest profile + virtio drivers + GRUB BIOS
@@ -114,6 +115,7 @@ AGENTS.md               you are here
 - `./modules/users.nix`
 - `./modules/k3s.nix`
 - `./modules/cert-manager.nix`
+- `./modules/oidc.nix`
 - `./modules/kubectl-tooling.nix`
 - `./modules/platforms/proxmox.nix`
 - `./disko/single-disk-bios.nix`
@@ -211,6 +213,22 @@ Declared in `modules/tenant.nix`. Full schema:
 | `certManager.caSecret.name` | str | `"ca-key-pair"` | k8s Secret name applied by the loader |
 | `certManager.caSecret.certPath` | str | `"/var/lib/cert-manager/ca.crt"` | path on target read by the loader |
 | `certManager.caSecret.keyPath` | str | `"/var/lib/cert-manager/ca.key"` | path on target read by the loader |
+| `oidc.enable` | bool | `false` | gates the entire OIDC stack (HelmChart + Ingress + Cert + secrets loader) |
+| `oidc.version` | str | `"7.15.2"` | oauth2-proxy chart version |
+| `oidc.namespace` | str | `"ingress-system"` | install namespace |
+| `oidc.releaseName` | str | `"oauth2-proxy"` | Helm release + in-cluster Service name |
+| `oidc.host` | str | derived `${hostName}.${domain}` | OAuth2-Proxy public hostname; cookie-domain default; redirect-url default |
+| `oidc.redirectUrl` | nullOr str | `null` | overrides derived `https://<host>/oauth2/callback`; for localhost / split-horizon DNS |
+| `oidc.issuerUrl` | nullOr str | `null` | OIDC issuer URL; required when `oidc.enable` |
+| `oidc.provider` | str | `"oidc"` | OAuth2-Proxy provider (`oidc` / `google` / `keycloak-oidc` / …) |
+| `oidc.upstream` | str | `"static://202"` | OAuth2-Proxy upstream (auth-url-only mode by default) |
+| `oidc.cookieDomain` | str | = `oidc.host` | cookie scope |
+| `oidc.extraArgs` | attrs | `{}` | additional OAuth2-Proxy CLI flags merged into rendered extraArgs |
+| `oidc.secretsPath.{clientId,clientSecret,cookieSecret,secretName}` | str | `/var/lib/oauth2-proxy/...`, `oauth2-proxy-secrets` | on-target paths + k8s Secret name |
+| `oidc.ingress.{enable,className,path}` | bool/str/str | `true`/`"traefik"`/`"/oauth2"` | rendered Ingress for /oauth2/* |
+| `oidc.tls.enable` | bool | `false` | render cert-manager Certificate + Ingress TLS block |
+| `oidc.tls.secretName` | str | `"oauth2-proxy-tls"` | Secret holding the TLS cert |
+| `oidc.tls.issuerRef` | nullOr str | = `clusterIssuer.name` when enabled, else `null` | ClusterIssuer the Certificate references |
 
 ### Assertions
 
@@ -221,6 +239,11 @@ Inside `modules/tenant.nix`:
 Inside `modules/cert-manager.nix`:
 - `clusterIssuer.enable && type == "ca"` ⇒ `ca.secretName != null`.
 - `clusterIssuer.enable && type ∈ {letsencryptStaging, letsencryptProd}` ⇒ `letsencrypt.email != null`.
+
+Inside `modules/oidc.nix`:
+- `oidc.enable` ⇒ `issuerUrl != null`.
+- `oidc.enable` ⇒ `host != ""` (defensive — should be unreachable given the default).
+- `oidc.enable && tls.enable` ⇒ `tls.issuerRef != null`.
 
 All fire at evaluation time via `config.assertions`. **Always add an
 assertion when you add an option that has cross-field validity
@@ -369,20 +392,61 @@ for d in examples/*/; do nix flake check "./${d%/}"; done
 # 8. The full system closure derivation evaluates (does not build).
 nix eval --raw '.#nixosConfigurations.soctalk.config.system.build.toplevel.drvPath'
 
-# 9. SECRETS-IN-STORE INVARIANT (§15). Plant a sentinel into
-#    examples/static-network/secrets/ca.{crt,key} and confirm it does
-#    NOT appear in the closure's derivations. Failure of this check
-#    is a critical regression — see §15.
-MARKER="ZZZ-CA-MARKER-$(date +%s)"
+# 9. SECRETS-IN-STORE INVARIANT (§15 + §16). Plant a sentinel into
+#    every secret-bearing file under examples/*/secrets/ and confirm
+#    it does NOT appear in any closure derivation. Failure of this
+#    check is a critical regression.
+MARKER="ZZZ-SECRET-MARKER-$(date +%s)"
+
+# static-network: CA materials.
 echo "$MARKER" > examples/static-network/secrets/ca.crt
 echo "$MARKER" > examples/static-network/secrets/ca.key
+
+# oidc: CA + OIDC credentials.
+for f in ca.crt ca.key client-id client-secret cookie-secret; do
+  echo "$MARKER" > examples/oidc/secrets/$f
+done
+
+# Re-evaluate both flakes.
 nix flake check ./examples/static-network >/dev/null
-TOP=$(nix eval --raw './examples/static-network#nixosConfigurations.edge-01.config.system.build.toplevel.drvPath')
-if nix-store -qR "$TOP" | xargs grep -l "$MARKER" 2>/dev/null; then
-  echo "REGRESSION: CA bytes are leaking into the closure"; exit 1
+nix flake check ./examples/oidc           >/dev/null
+
+# Search both closures.
+HITS=0
+for top_attr in \
+  './examples/static-network#nixosConfigurations.edge-01.config.system.build.toplevel.drvPath' \
+  './examples/oidc#nixosConfigurations.edge-01.config.system.build.toplevel.drvPath' \
+; do
+  TOP=$(nix eval --raw "$top_attr")
+  N=$(nix-store -qR "$TOP" | xargs grep -l "$MARKER" 2>/dev/null | wc -l)
+  HITS=$(( HITS + N ))
+done
+
+if [ "$HITS" -gt 0 ]; then
+  echo "REGRESSION: $HITS closure entries contain secret bytes"; exit 1
 fi
-rm -f examples/static-network/secrets/ca.crt examples/static-network/secrets/ca.key
+
+# Cleanup
+rm -f examples/static-network/secrets/{ca.crt,ca.key} \
+      examples/oidc/secrets/{ca.crt,ca.key,client-id,client-secret,cookie-secret}
 echo "secrets-in-store invariant: PASS"
+```
+
+```bash
+# 10. OIDC: in-repo soctalk has no OIDC artifacts (default disabled).
+nix eval --impure --json --expr 'let c = (builtins.getFlake (toString /wa/soc/soctalk-nixos)).nixosConfigurations.soctalk.config; in {
+  hasHelmChart = c.services.k3s.manifests ? oauth2-proxy;
+  hasIngress   = c.services.k3s.manifests ? oauth2-proxy-ingress;
+  hasCert      = c.services.k3s.manifests ? oauth2-proxy-cert;
+  hasService   = c.systemd.services ? oauth2-proxy-secrets;
+}' | jq    # → all four: false
+
+# 11. OIDC example renders all four pieces; host derives correctly; redirect-url is the derived default.
+nix eval --json './examples/oidc#nixosConfigurations.edge-01.config.services.k3s.manifests.oauth2-proxy.content.spec.valuesContent' \
+  | jq '. | fromjson | .extraArgs'   # contains "redirect-url" matching derived URL
+
+nix eval --raw './examples/oidc#nixosConfigurations.edge-01.config.soctalk.tenant.oidc.host'
+# → "edge-01.example.org"
 ```
 
 If any value in (2) changes from a known-good snapshot without a
@@ -428,13 +492,21 @@ nixpkgs. Every loose input doubles the lock-file evaluation cost.
 
 ## 13. Examples
 
-Three flakes under `examples/`:
+Four flakes under `examples/`:
 
 | Dir | What it proves |
 |---|---|
 | `minimal/` | Defaults work: only the required `network.{address,gateway}` are set; everything else falls back. Validates the option-default path. |
-| `static-network/` | Every tenant option overridable: timezone, locale, disk, users, SSH keys, full networking. Validates the full override surface. |
+| `static-network/` | Every tenant option overridable: timezone, locale, disk, users, SSH keys, full networking, plus cert-manager with a CA ClusterIssuer + caSecret loader. Validates the full override surface and the cert-manager secret-loader path. |
 | `dhcp/` | The assertion-relaxation path when `useDHCP = true`. Validates that `address`/`gateway` correctly become optional. |
+| `oidc/` | End-to-end auth stack: cert-manager + ClusterIssuer + OAuth2-Proxy + Ingress + TLS via cert-manager. Validates the OIDC host derivation, the `redirectUrl` override, and the cert-manager → OIDC integration through `tls.issuerRef`. |
+
+The fourth example (`oidc/`) is justified despite §13's "don't add a
+fourth" guidance because it's the **only** example that exercises
+the full cert-manager + Ingress + TLS chain end-to-end, plus a
+second on-target secret loader (`oauth2-proxy-secrets.service`). It
+catches regressions that `static-network/` alone can't — notably,
+the host-derivation logic and `tls.issuerRef` cross-module default.
 
 Conventions:
 - **Input style**: `inputs.soctalk-nixos.url = "path:../..";`. This
@@ -603,7 +675,123 @@ after rotating `ca.{crt,key}` propagates the update. There's no
 Consumers using agenix/sops-nix override `certPath` / `keyPath` to
 their runtime decryption paths (e.g., `/run/agenix/...`).
 
-## 16. When to bump nixpkgs-unstable
+## 16. OIDC / OAuth2-Proxy design
+
+`modules/oidc.nix` is the third "appliance plug-in", after
+`modules/k3s.nix` and `modules/cert-manager.nix`. Unlike those two,
+the OIDC stack is **opt-in** (`soctalk.tenant.oidc.enable = false`
+by default) because OAuth2-Proxy refuses to start without
+credentials.
+
+### What `enable = true` produces
+
+| Manifest / unit | Always present when enable=true | Notes |
+|---|---|---|
+| `oauth2-proxy` HelmChart | yes | Non-bootstrap. Standard K3s `services.k3s.manifests.<name>.content` |
+| `oauth2-proxy-ingress` | gated on `oidc.ingress.enable` (default true) | Renders the `/oauth2/*` Ingress for the consumer's installed ingress controller to pick up |
+| `oauth2-proxy-cert` | gated on `oidc.tls.enable` (default false) | cert-manager `Certificate` that mints the Ingress's TLS Secret |
+| `oauth2-proxy-secrets.service` | yes | systemd one-shot that loads client-id / client-secret / cookie-secret from on-target files into a kubernetes Secret; same shape as `cert-manager-ca-secret.service` |
+| `systemd.tmpfiles` 0400 rules | yes | enforces strict perms on the three credential paths |
+
+### Host derivation
+
+`oidc.host` defaults to:
+
+```text
+if networking.domain is set: "${networking.hostName}.${networking.domain}"
+else:                        networking.hostName
+```
+
+Always overridable as a plain option. The derived host is used as:
+
+- `Ingress.spec.rules[0].host`
+- `Certificate.spec.dnsNames[0]`
+- the default `cookieDomain`
+- the default `redirectUrl` (`https://<host>/oauth2/callback`)
+
+`oidc.redirectUrl` is an explicit nullable string. When set, it wins
+verbatim over the derived default. Use it for:
+
+- **localhost / port-forward testing**: `redirectUrl = "http://localhost:4180/oauth2/callback"`
+- **split-horizon DNS**: the IdP sees a different public hostname than the in-cluster Ingress host.
+- **reverse-proxy chains** that rewrite the Host header.
+
+### Credentials loader
+
+Three files on the target machine, one Kubernetes Secret. The chart's `config.existingSecret` is wired automatically to `secretsPath.secretName` (default `oauth2-proxy-secrets`). Key names inside the Secret match the chart's expectations: `client-id`, `client-secret`, `cookie-secret`.
+
+**Critical invariant (shared with §15):** the bytes never enter the
+`/nix/store`. The module declares only file *paths*. The loader
+reads files at boot, pipes through `kubectl create --dry-run=client
+-o yaml | kubectl apply -f -`, and never writes the rendered
+manifest to disk.
+
+**The verification protocol §10 step 9 covers BOTH `examples/static-network/secrets/` AND `examples/oidc/secrets/`.** Run it after touching either module.
+
+### TLS via cert-manager
+
+`tls.enable = false` by default — first-time consumers can flip on
+OIDC without standing up a working ClusterIssuer first. Production
+deploys should set `tls.enable = true`; most OIDC providers reject
+http redirect URLs.
+
+When `tls.enable = true`:
+
+- A `Certificate` is rendered referencing `tls.issuerRef`.
+- The Ingress gets a `spec.tls[]` block referencing `tls.secretName`.
+
+`tls.issuerRef` has a smart default: if
+`certManager.clusterIssuer.enable` is `true`, the default is
+`certManager.clusterIssuer.name`. So enabling both is the
+single-line "and now TLS" toggle:
+
+```nix
+certManager.clusterIssuer = { enable = true; type = "ca"; ca.secretName = "ca-key-pair"; };
+oidc.tls.enable = true;   # issuerRef auto-derives
+```
+
+### Ingress controller dependency
+
+Same as cert-manager's letsencrypt path: the bundle does **not**
+ship an ingress controller. Consumer installs Traefik v3 or
+ingress-nginx and aligns `oidc.ingress.className`. With the
+controller missing, the `oauth2-proxy-ingress` manifest applies but
+gets no traffic.
+
+Default `ingress.className = "traefik"`. **Note** this differs from
+some consumers' default of `nginx` — consumers using ingress-nginx
+need to flip the option explicitly. (Set the cert-manager
+`letsencrypt.solver.http01.ingressClass` to the same class to keep
+the two aligned.)
+
+### Provider value
+
+`oidc.provider` defaults to the generic `"oidc"` value, which works
+with any OIDC-compliant IdP (Keycloak, Authentik, Dex, Auth0,
+Okta, …). Override for IdPs OAuth2-Proxy supports natively
+(`google`, `github`, `gitlab`, …). The corresponding OAuth2-Proxy
+flags they need (e.g., `--google-group`, `--github-org`) go through
+`oidc.extraArgs` — that attrset is merged after our rendered defaults
+so consumer keys win.
+
+### Protecting apps with auth-url annotations
+
+The bundle does NOT touch consumer apps' Ingresses — protection is
+the app's responsibility. README.md and `examples/oidc/README.md`
+document both:
+
+- **ingress-nginx**: `nginx.ingress.kubernetes.io/auth-url`, `auth-signin`, `auth-response-headers`.
+- **Traefik v3**: a `Middleware` of type `forwardAuth` referencing `http://oauth2-proxy.ingress-system.svc.cluster.local:80/oauth2/auth`.
+
+### When to refactor the Secret-loader pattern
+
+`cert-manager-ca-secret.service` and `oauth2-proxy-secrets.service`
+are structural duplicates: same wait loop, same `kubectl ... --dry-run | kubectl apply -f -` shape, same tmpfiles perms enforcement. If a **third** loader appears (e.g., a generic database password loader),
+**factor out a common `lib/secret-from-files` helper** rather than
+copy-paste a third time. Until then, keeping them separate avoids
+premature abstraction.
+
+## 17. When to bump nixpkgs-unstable
 
 The overlay isolates `pkgs.unstable` from the rest of the system, so
 bumping it should only affect K3s + Cilium tooling. Bump when:
@@ -619,7 +807,7 @@ regressions:
 nix build .#nixosConfigurations.soctalk.config.system.build.toplevel
 ```
 
-## 17. When to bump Cilium
+## 18. When to bump Cilium
 
 Change two things together:
 1. `cilium/values.yaml` — review release notes for value renames.
@@ -633,7 +821,7 @@ After bumping:
 - Confirm a test pod can reach `kubernetes.default.svc` and the
   outside internet.
 
-## 18. Common pitfalls
+## 19. Common pitfalls
 
 | Pitfall | What happens | Avoid by |
 |---|---|---|
@@ -642,6 +830,10 @@ After bumping:
 | Calling `builtins.readFile ./secrets/...` from a consumer flake | CA bytes get embedded into `/nix/store` → world-readable | Use `caSecret.{certPath, keyPath}` (paths only), stage files on the target via `--extra-files` / scp / agenix / sops-nix (see §15) |
 | Using `letsencrypt*` ClusterIssuer without installing an ingress controller | Certificates never issue; http01 solvers stuck pending forever | Install Traefik v3 or ingress-nginx first, and align `letsencrypt.solver.http01.ingressClass` |
 | Default `letsencrypt.solver.http01.ingressClass = "traefik"` mismatched with an installed `nginx` controller | ACME solver Ingress is ignored | Set the option to the actually-installed class name |
+| Enabling `oidc.tls.enable` without `clusterIssuer.enable` and without setting `tls.issuerRef` | Eval-time assertion fires (see §16) | Either enable `certManager.clusterIssuer` or set `oidc.tls.issuerRef` explicitly |
+| Enabling `oidc.enable` without staging `/var/lib/oauth2-proxy/{client-id,client-secret,cookie-secret}` | `oauth2-proxy-secrets.service` fails with "required file missing or empty"; OAuth2-Proxy CrashLoopBackOff (chart can't reference the Secret) | Stage all three files via `--extra-files` / scp / agenix / sops-nix before deploy |
+| Default `oidc.ingress.className = "traefik"` mismatched with an installed `nginx` controller | `/oauth2/*` requests 404 — no controller picks up the Ingress | Set `oidc.ingress.className = "nginx"` (and consider aligning `letsencrypt.solver.http01.ingressClass` too) |
+| `oidc.host` mismatched with the IdP's registered redirect URI | OIDC callback fails after login with "invalid redirect_uri" | Either fix `oidc.host` / `oidc.redirectUrl` to match what's registered, or update the IdP client's authorized redirect URIs |
 | Setting `i18n.defaultLocale` in `modules/base.nix` | "conflicting definitions" with `modules/tenant.nix` | Only `modules/tenant.nix` sets it |
 | Importing `config/{users,ssh-keys}.nix` outside `modules/tenant.nix` | Consumer overrides via tenant don't take effect | Only `modules/tenant.nix` imports them |
 | Adding a per-host fact directly to `hosts/<name>/tenant.nix` outside the schema | Doesn't translate to any NixOS option | Add the option to `modules/tenant.nix` first |
@@ -651,7 +843,7 @@ After bumping:
 | Forgetting to `git add` before `nix flake check` | Stale evaluation against committed tree | Always `git add -A` before checking |
 | Not bumping example lockfiles after a root bump | Examples drift from upstream | Run `nix flake update` in each example dir after a root bump |
 
-## 19. What is intentionally NOT in scope
+## 20. What is intentionally NOT in scope
 
 - **Multi-platform in one flake.** The bundle hard-imports
   `modules/platforms/proxmox.nix`. To target EC2 or Hetzner, fork or
@@ -677,7 +869,7 @@ If a request lands that looks like one of the above, push back: it
 probably belongs in a downstream consumer flake, not in this
 upstream.
 
-## 20. Provenance
+## 21. Provenance
 
 Lifted from `/wa/nix/mynix/hosts/soctalk/` after that cluster's
 configuration was validated end-to-end. The non-obvious choices in
