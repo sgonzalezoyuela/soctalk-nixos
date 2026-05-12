@@ -214,7 +214,7 @@ Declared in `modules/tenant.nix`. Full schema:
 | `certManager.caSecret.certPath` | str | `"/var/lib/cert-manager/ca.crt"` | path on target read by the loader |
 | `certManager.caSecret.keyPath` | str | `"/var/lib/cert-manager/ca.key"` | path on target read by the loader |
 | `oidc.enable` | bool | `false` | gates the entire OIDC stack (HelmChart + Ingress + Cert + secrets loader) |
-| `oidc.version` | str | `"7.15.2"` | oauth2-proxy chart version |
+| `oidc.version` | str | `"10.4.3"` | oauth2-proxy **chart** version (bundles app `v7.15.2`). The chart version and the app version are decoupled — see https://oauth2-proxy.github.io/manifests/index.yaml |
 | `oidc.namespace` | str | `"ingress-system"` | install namespace |
 | `oidc.releaseName` | str | `"oauth2-proxy"` | Helm release + in-cluster Service name |
 | `oidc.host` | str | derived `${hostName}.${domain}` | OAuth2-Proxy public hostname; cookie-domain default; redirect-url default |
@@ -831,6 +831,7 @@ After bumping:
 | Using `letsencrypt*` ClusterIssuer without installing an ingress controller | Certificates never issue; http01 solvers stuck pending forever | Install Traefik v3 or ingress-nginx first, and align `letsencrypt.solver.http01.ingressClass` |
 | Default `letsencrypt.solver.http01.ingressClass = "traefik"` mismatched with an installed `nginx` controller | ACME solver Ingress is ignored | Set the option to the actually-installed class name |
 | Enabling `oidc.tls.enable` without `clusterIssuer.enable` and without setting `tls.issuerRef` | Eval-time assertion fires (see §16) | Either enable `certManager.clusterIssuer` or set `oidc.tls.issuerRef` explicitly |
+| Setting `oidc.version` to the OAuth2-Proxy **app** version (e.g. `7.15.2`) instead of the **chart** version (e.g. `10.4.3`) | `helm-install-oauth2-proxy-*` Job CrashLoopBackOff with `Error: INSTALLATION FAILED: chart "oauth2-proxy" matching 7.15.2 not found in oauth2-proxy index` | Always use a chart version from https://oauth2-proxy.github.io/manifests/index.yaml; pick one whose `appVersion` matches the OAuth2-Proxy release you want. The two have separate version trains. |
 | Enabling `oidc.enable` without staging `/var/lib/oauth2-proxy/{client-id,client-secret,cookie-secret}` | `oauth2-proxy-secrets.service` fails with "required file missing or empty"; OAuth2-Proxy CrashLoopBackOff (chart can't reference the Secret) | Stage all three files via `--extra-files` / scp / agenix / sops-nix before deploy |
 | Default `oidc.ingress.className = "traefik"` mismatched with an installed `nginx` controller | `/oauth2/*` requests 404 — no controller picks up the Ingress | Set `oidc.ingress.className = "nginx"` (and consider aligning `letsencrypt.solver.http01.ingressClass` too) |
 | `oidc.host` mismatched with the IdP's registered redirect URI | OIDC callback fails after login with "invalid redirect_uri" | Either fix `oidc.host` / `oidc.redirectUrl` to match what's registered, or update the IdP client's authorized redirect URIs |

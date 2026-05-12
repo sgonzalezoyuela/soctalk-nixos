@@ -27,7 +27,7 @@ End-to-end consumer flake demonstrating cert-manager + ClusterIssuer
 
 | | |
 |---|---|
-| Chart version | `7.15.2` |
+| Chart version | `10.4.3` *(default; bundles OAuth2-Proxy app `v7.15.2`)* |
 | Namespace | `ingress-system` *(default)* |
 | OIDC host | `edge-01.example.org` *(derived from hostname + domain)* |
 | Redirect URL | `https://edge-01.example.org/oauth2/callback` *(derived)* |

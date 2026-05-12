@@ -125,7 +125,7 @@ All knobs live under `soctalk.tenant.*`. Full schema in
 | `certManager.caSecret.certPath` | str | `/var/lib/cert-manager/ca.crt` | path on target |
 | `certManager.caSecret.keyPath` | str | `/var/lib/cert-manager/ca.key` | path on target |
 | `oidc.enable` | bool | `false` | opt in to OAuth2-Proxy stack |
-| `oidc.version` | str | `7.15.2` | oauth2-proxy chart version |
+| `oidc.version` | str | `10.4.3` | oauth2-proxy **chart** version (bundles app `v7.15.2`); see the chart's [index.yaml](https://oauth2-proxy.github.io/manifests/index.yaml) for the chart↔appVersion mapping |
 | `oidc.namespace` | str | `ingress-system` | install namespace |
 | `oidc.releaseName` | str | `oauth2-proxy` | Helm release + Service name |
 | `oidc.host` | str | derived `${hostName}.${domain}` | OAuth2-Proxy public hostname |

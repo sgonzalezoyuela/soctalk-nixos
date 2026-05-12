@@ -68,8 +68,18 @@ in
 
     version = lib.mkOption {
       type = lib.types.str;
-      default = "7.15.2";
-      description = "oauth2-proxy Helm chart version.";
+      default = "10.4.3";
+      example = "10.4.3";
+      description = ''
+        oauth2-proxy Helm **chart** version (NOT the OAuth2-Proxy
+        image / app version — those are decoupled). The default
+        `10.4.3` chart bundles OAuth2-Proxy app `7.15.2`.
+
+        Chart versions live at
+        https://oauth2-proxy.github.io/manifests/index.yaml — pick
+        one whose `appVersion` matches the OAuth2-Proxy release you
+        want.
+      '';
     };
 
     namespace = lib.mkOption {
