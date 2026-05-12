@@ -71,7 +71,8 @@ modules/
   tenant.nix            DECLARES soctalk.tenant.* options + TRANSLATES them
   users.nix             reads tenant.adminUsers / tenant.sshAuthorizedKeys
   k3s.nix               K3s server + declarative Cilium HelmChart + firewall
-  kubectl-tooling.nix   kubectl + helm + k9s + cilium-cli + hubble + completions
+  cert-manager.nix      cert-manager HelmChart + optional ClusterIssuer + optional CA Secret loader
+  kubectl-tooling.nix   kubectl + helm + k9s + cilium-cli + hubble + cmctl + completions
   platforms/
     proxmox.nix         qemu-guest profile + virtio drivers + GRUB BIOS
     README.md           how to add a new platform
@@ -112,6 +113,7 @@ AGENTS.md               you are here
 - `./modules/tenant.nix`
 - `./modules/users.nix`
 - `./modules/k3s.nix`
+- `./modules/cert-manager.nix`
 - `./modules/kubectl-tooling.nix`
 - `./modules/platforms/proxmox.nix`
 - `./disko/single-disk-bios.nix`
@@ -195,6 +197,20 @@ Declared in `modules/tenant.nix`. Full schema:
 | `network.nameservers` | listOf str | `[]` | `networking.nameservers` |
 | `network.domain` | nullOr str | `null` | `networking.domain` |
 | `network.enableIPv6` | bool | `false` | `networking.enableIPv6` |
+| `certManager.version` | str | `"v1.20.1"` | `services.k3s.manifests.cert-manager.content.spec.version` |
+| `certManager.namespace` | str | `"cert-manager"` | `services.k3s.manifests.cert-manager.content.spec.targetNamespace` |
+| `certManager.installCRDs` | bool | `true` | `crds.enabled` inside the HelmChart `valuesContent` |
+| `certManager.clusterIssuer.enable` | bool | `false` | gates the `cluster-issuer` K3s manifest |
+| `certManager.clusterIssuer.name` | str | `"default"` | ClusterIssuer `metadata.name` |
+| `certManager.clusterIssuer.type` | enum (selfSigned/ca/letsencryptStaging/letsencryptProd) | `"selfSigned"` | shape of ClusterIssuer `spec` |
+| `certManager.clusterIssuer.ca.secretName` | nullOr str | `null` | `spec.ca.secretName` when type=`ca` |
+| `certManager.clusterIssuer.letsencrypt.email` | nullOr str | `null` | `spec.acme.email` for letsencrypt* |
+| `certManager.clusterIssuer.letsencrypt.solver.type` | enum (http01) | `"http01"` | which solver array entry to render |
+| `certManager.clusterIssuer.letsencrypt.solver.http01.ingressClass` | str | `"traefik"` | `spec.acme.solvers[0].http01.ingress.class` |
+| `certManager.caSecret.enable` | bool | `false` | gates the `cert-manager-ca-secret.service` systemd unit |
+| `certManager.caSecret.name` | str | `"ca-key-pair"` | k8s Secret name applied by the loader |
+| `certManager.caSecret.certPath` | str | `"/var/lib/cert-manager/ca.crt"` | path on target read by the loader |
+| `certManager.caSecret.keyPath` | str | `"/var/lib/cert-manager/ca.key"` | path on target read by the loader |
 
 ### Assertions
 
@@ -202,7 +218,11 @@ Inside `modules/tenant.nix`:
 - `useDHCP || address != null` — static mode requires an address.
 - `useDHCP || gateway != null` — static mode requires a gateway.
 
-Both fire at evaluation time via `config.assertions`. **Always add an
+Inside `modules/cert-manager.nix`:
+- `clusterIssuer.enable && type == "ca"` ⇒ `ca.secretName != null`.
+- `clusterIssuer.enable && type ∈ {letsencryptStaging, letsencryptProd}` ⇒ `letsencrypt.email != null`.
+
+All fire at evaluation time via `config.assertions`. **Always add an
 assertion when you add an option that has cross-field validity
 requirements.** The cost is zero at runtime; the alternative is
 "deployed VM hangs on boot waiting for a non-existent gateway".
@@ -329,11 +349,40 @@ done
 nix eval --json '.#nixosConfigurations.soctalk.config.users.users.atricore.openssh.authorizedKeys.keys' | jq 'length'   # → 3
 nix eval --json '.#nixosConfigurations.soctalk.config.users.users.root.openssh.authorizedKeys.keys'       | jq 'length' # → 3
 
-# 4. Every example evaluates.
+# 4. cert-manager HelmChart rendered for the in-repo soctalk host.
+nix eval --json '.#nixosConfigurations.soctalk.config.services.k3s.manifests.cert-manager.content.spec' \
+  | jq '{chart, version, targetNamespace, createNamespace, valuesContent}'
+
+# 5. In-repo soctalk has NO ClusterIssuer and NO caSecret unit.
+nix eval --impure --expr 'let f = builtins.getFlake (toString /wa/soc/soctalk-nixos); c = f.nixosConfigurations.soctalk.config; in {
+  hasClusterIssuer    = c.services.k3s.manifests ? cluster-issuer;       # → false
+  hasCaSecretService  = c.systemd.services ? cert-manager-ca-secret;    # → false
+}' --json | jq
+
+# 6. cmctl is in the closure.
+nix eval '.#nixosConfigurations.soctalk.config.environment.systemPackages' \
+  --apply 'pkgs: builtins.length (builtins.filter (p: (p.pname or "") == "cmctl") pkgs)'   # → 1
+
+# 7. Every example evaluates.
 for d in examples/*/; do nix flake check "./${d%/}"; done
 
-# 5. The full system closure derivation evaluates (does not build).
+# 8. The full system closure derivation evaluates (does not build).
 nix eval --raw '.#nixosConfigurations.soctalk.config.system.build.toplevel.drvPath'
+
+# 9. SECRETS-IN-STORE INVARIANT (§15). Plant a sentinel into
+#    examples/static-network/secrets/ca.{crt,key} and confirm it does
+#    NOT appear in the closure's derivations. Failure of this check
+#    is a critical regression — see §15.
+MARKER="ZZZ-CA-MARKER-$(date +%s)"
+echo "$MARKER" > examples/static-network/secrets/ca.crt
+echo "$MARKER" > examples/static-network/secrets/ca.key
+nix flake check ./examples/static-network >/dev/null
+TOP=$(nix eval --raw './examples/static-network#nixosConfigurations.edge-01.config.system.build.toplevel.drvPath')
+if nix-store -qR "$TOP" | xargs grep -l "$MARKER" 2>/dev/null; then
+  echo "REGRESSION: CA bytes are leaking into the closure"; exit 1
+fi
+rm -f examples/static-network/secrets/ca.crt examples/static-network/secrets/ca.key
+echo "secrets-in-store invariant: PASS"
 ```
 
 If any value in (2) changes from a known-good snapshot without a
@@ -422,6 +471,12 @@ The README has the full prose; the AGENTS.md-relevant warnings:
   taint(s)`. **Do not remove this field.** Reference:
   github.com/k3s-io/helm-controller — chart.go,
   `if chart.Spec.Bootstrap` branch.
+- **cert-manager is NOT a bootstrap HelmChart** — it installs after
+  the CNI is up, after the node is Ready, just like any normal
+  workload. The HelmChart in `modules/cert-manager.nix` deliberately
+  omits `bootstrap = true`. **Do not add it** — it would force
+  cert-manager onto the host network and break the standard
+  webhook / API path.
 - **`routingMode: native`** — `tunnel` (VXLAN) failed silently on
   single-node, with no drop counters anywhere. Native fixed it.
   **Do not flip back to tunnel** without re-validating end-to-end
@@ -442,7 +497,113 @@ The README has the full prose; the AGENTS.md-relevant warnings:
   responsibilities. **Do not re-enable any of these** without first
   disabling the matching Cilium feature.
 
-## 15. When to bump nixpkgs-unstable
+## 15. cert-manager design
+
+`modules/cert-manager.nix` is the cert-manager equivalent of
+`modules/k3s.nix`: it bakes cert-manager into the appliance and
+exposes a tenant-configurable surface for the two pieces consumers
+actually care about — the ClusterIssuer and how the CA Secret gets
+into the cluster.
+
+### Always installed; never `enable`-able
+
+Per §4, the bundle is coarse. cert-manager has no `enable` toggle;
+it ships with every deploy. Only its **configuration** is tunable.
+
+### `clusterIssuer` is a tagged union, opt-in
+
+`soctalk.tenant.certManager.clusterIssuer.enable = false` by default.
+When `true`, exactly one of four ClusterIssuer kinds is produced
+based on `type`:
+
+| `type` | Out-of-the-box | External dependency |
+|---|---|---|
+| `selfSigned` | ✅ | none |
+| `ca` | ✅ if `caSecret.*` is also enabled | the CA tls Secret must exist in the namespace |
+| `letsencryptStaging` | ❌ | needs an ingress controller matching `letsencrypt.solver.http01.ingressClass` |
+| `letsencryptProd` | ❌ | same |
+
+The bundle does **not** ship an ingress controller. AGENTS.md §19
+says secrets backends are out of scope; the same logic applies here
+— ingress controllers are downstream concerns. If a
+consumer needs ACME http01, they install Traefik v3 or ingress-nginx
+themselves and set `ingressClass` accordingly. See `README.md` for
+the install snippets.
+
+### `caSecret`: load a Secret from on-target files, NEVER from Nix
+
+`soctalk.tenant.certManager.caSecret.enable = true` declares a
+systemd one-shot (`cert-manager-ca-secret.service`) that:
+
+1. Waits for the K3s API server (`/readyz`) and the cert-manager
+   namespace.
+2. Reads the CA cert + key from `caSecret.certPath` and
+   `caSecret.keyPath` on the **target machine's** filesystem.
+3. Pipes `kubectl create secret tls --dry-run=client -o yaml` into
+   `kubectl apply -f -` so the bytes never touch disk outside their
+   on-target paths.
+
+**Critical invariant:** the cert / key bytes never enter the Nix
+store. The module declares only **paths** (strings). It does not
+call `builtins.readFile` on anything in the consumer's `secrets/`
+directory. This is what makes "encrypted-at-rest in the consumer
+repo, decrypted at boot via agenix/sops-nix" work: the consumer
+points `certPath` / `keyPath` at the decrypted runtime paths and
+the same loader keeps working without changes.
+
+**The verification protocol §10 step 9 plants a sentinel into
+`examples/static-network/secrets/ca.{crt,key}` and asserts the
+sentinel does not appear in the closure.** Run it whenever you
+touch `modules/cert-manager.nix` or the static-network example —
+failure of that check is a critical regression and an immediate
+"do not ship" gate.
+
+### How CA files actually reach the target
+
+Three paths, in increasing production-readiness:
+
+| Mechanism | Use case |
+|---|---|
+| `nixos-anywhere --extra-files <dir>` | fresh, destructive deploy; consumer stages an `extra-files/var/lib/cert-manager/ca.*` tree |
+| `scp` + `nixos-rebuild switch` | incremental update; `systemctl restart cert-manager-ca-secret.service` after |
+| `agenix` / `sops-nix` | production; encrypted-at-rest in repo, decrypted at boot to a tmpfs path; point `certPath`/`keyPath` at that path |
+
+The bundle has no opinion on which one — it just expects the files
+to exist when the systemd unit runs. AGENTS.md §19 is explicit:
+**we provide a Secret loader, not a secrets backend.**
+
+### Manifest-apply ordering
+
+K3s' addon-applier runs on a loop and retries failed manifests. When
+the bundle installs cert-manager + a ClusterIssuer simultaneously,
+the ClusterIssuer's first apply pass typically fails because the
+CRDs haven't been established yet. Subsequent passes succeed
+(usually within ~30s). **Expect a transient flurry of
+`failed to apply ClusterIssuer …: no matches for kind` log lines on
+fresh deploys.** Not a regression — it self-heals.
+
+### Idempotent re-runs
+
+`cert-manager-ca-secret.service` is `Type=oneshot,
+RemainAfterExit=yes` and `Restart=on-failure`. The `kubectl apply`
+is idempotent, so rebooting (or `systemctl restart`-ing the unit)
+after rotating `ca.{crt,key}` propagates the update. There's no
+`path` watcher; rotations require an explicit restart.
+
+### Default paths and naming
+
+- `caSecret.certPath = "/var/lib/cert-manager/ca.crt"` — under
+  `/var/lib/` because that's the FHS-blessed location for variable
+  state files owned by services. `tmpfiles` enforces `0444 root root`.
+- `caSecret.keyPath = "/var/lib/cert-manager/ca.key"` — same dir;
+  `tmpfiles` enforces `0400 root root`.
+- `caSecret.name = "ca-key-pair"` — matches the cert-manager
+  convention used in the project's docs.
+
+Consumers using agenix/sops-nix override `certPath` / `keyPath` to
+their runtime decryption paths (e.g., `/run/agenix/...`).
+
+## 16. When to bump nixpkgs-unstable
 
 The overlay isolates `pkgs.unstable` from the rest of the system, so
 bumping it should only affect K3s + Cilium tooling. Bump when:
@@ -458,7 +619,7 @@ regressions:
 nix build .#nixosConfigurations.soctalk.config.system.build.toplevel
 ```
 
-## 16. When to bump Cilium
+## 17. When to bump Cilium
 
 Change two things together:
 1. `cilium/values.yaml` — review release notes for value renames.
@@ -472,11 +633,15 @@ After bumping:
 - Confirm a test pod can reach `kubernetes.default.svc` and the
   outside internet.
 
-## 17. Common pitfalls
+## 18. Common pitfalls
 
 | Pitfall | What happens | Avoid by |
 |---|---|---|
 | Removing / forgetting `spec.bootstrap = true` on the Cilium `HelmChart` | Every kube-system pod stuck Pending with "untolerated taint(s)" — Cilium never installs because its helm-install Job can't schedule on a NotReady (CNI-less) node | Keep `bootstrap = true` (see §14) |
+| Adding `spec.bootstrap = true` to the cert-manager `HelmChart` | cert-manager runs with `hostNetwork: true`, breaks the webhook / API path | Leave it omitted (see §14) |
+| Calling `builtins.readFile ./secrets/...` from a consumer flake | CA bytes get embedded into `/nix/store` → world-readable | Use `caSecret.{certPath, keyPath}` (paths only), stage files on the target via `--extra-files` / scp / agenix / sops-nix (see §15) |
+| Using `letsencrypt*` ClusterIssuer without installing an ingress controller | Certificates never issue; http01 solvers stuck pending forever | Install Traefik v3 or ingress-nginx first, and align `letsencrypt.solver.http01.ingressClass` |
+| Default `letsencrypt.solver.http01.ingressClass = "traefik"` mismatched with an installed `nginx` controller | ACME solver Ingress is ignored | Set the option to the actually-installed class name |
 | Setting `i18n.defaultLocale` in `modules/base.nix` | "conflicting definitions" with `modules/tenant.nix` | Only `modules/tenant.nix` sets it |
 | Importing `config/{users,ssh-keys}.nix` outside `modules/tenant.nix` | Consumer overrides via tenant don't take effect | Only `modules/tenant.nix` imports them |
 | Adding a per-host fact directly to `hosts/<name>/tenant.nix` outside the schema | Doesn't translate to any NixOS option | Add the option to `modules/tenant.nix` first |
@@ -486,7 +651,7 @@ After bumping:
 | Forgetting to `git add` before `nix flake check` | Stale evaluation against committed tree | Always `git add -A` before checking |
 | Not bumping example lockfiles after a root bump | Examples drift from upstream | Run `nix flake update` in each example dir after a root bump |
 
-## 18. What is intentionally NOT in scope
+## 19. What is intentionally NOT in scope
 
 - **Multi-platform in one flake.** The bundle hard-imports
   `modules/platforms/proxmox.nix`. To target EC2 or Hetzner, fork or
@@ -497,9 +662,14 @@ After bumping:
   for single-node (`routingMode: native`, no kube-proxy, etc.).
   Multi-node would need a different Cilium config and likely an
   external etcd or sqlite-replacement.
-- **Secrets management.** No agenix, no sops-nix. Consumers add
+- **Secrets backend.** No agenix, no sops-nix. Consumers add
   their own via `extraModules`. Hard-coding a secrets backend in the
-  bundle would force every consumer onto it.
+  bundle would force every consumer onto it. **What the bundle DOES
+  provide** (see §15) is `certManager.caSecret.*` — a *Secret loader*
+  that consumes file paths on the target, plus systemd-tmpfiles rules
+  that enforce strict perms on those paths. The consumer picks how
+  the files arrive (manual scp, `--extra-files`, agenix-decrypted
+  tmpfs, sops-nix-decrypted tmpfs, …) — the loader is mechanism-agnostic.
 - **Container registry credentials, image building, CI** — out of
   scope; consumers wire their own.
 
@@ -507,7 +677,7 @@ If a request lands that looks like one of the above, push back: it
 probably belongs in a downstream consumer flake, not in this
 upstream.
 
-## 19. Provenance
+## 20. Provenance
 
 Lifted from `/wa/nix/mynix/hosts/soctalk/` after that cluster's
 configuration was validated end-to-end. The non-obvious choices in

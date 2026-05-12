@@ -23,7 +23,12 @@ configuration was validated end-to-end.
 - Cilium 1.18.4 installed by K3s' helm-controller, configured for
   single-node operation: native routing, iptables masquerade,
   endpointRoutes, kube-proxy replacement
-- kubectl + kubernetes-helm + kubecolor + k9s + cilium-cli + hubble
+- **cert-manager v1.20.1** installed declaratively, ready for
+  `ClusterIssuer` / `Certificate` resources. Optional tenant-driven
+  ClusterIssuer (selfSigned / ca / letsencryptStaging / letsencryptProd)
+  and an on-target CA Secret loader (`certManager.caSecret.*`) — see
+  the option table below.
+- kubectl + kubernetes-helm + kubecolor + k9s + cilium-cli + hubble + cmctl
   on the host
 - System-wide `k = kubecolor` alias with kubectl completion bound to
   both `kubecolor` and `k`
@@ -99,10 +104,59 @@ All knobs live under `soctalk.tenant.*`. Full schema in
 | `network.nameservers` | listOf str | `[]` | DNS resolvers |
 | `network.domain` | nullOr str | `null` | DNS search domain |
 | `network.enableIPv6` | bool | `false` | IPv6 toggle |
+| `certManager.version` | str | `v1.20.1` | cert-manager Helm chart version |
+| `certManager.namespace` | str | `cert-manager` | install namespace |
+| `certManager.installCRDs` | bool | `true` | render `crds.enabled` into chart values |
+| `certManager.clusterIssuer.enable` | bool | `false` | opt in to declarative ClusterIssuer |
+| `certManager.clusterIssuer.name` | str | `default` | `metadata.name` |
+| `certManager.clusterIssuer.type` | enum | `selfSigned` | `selfSigned` \| `ca` \| `letsencryptStaging` \| `letsencryptProd` |
+| `certManager.clusterIssuer.ca.secretName` | nullOr str | `null` | required when `type = "ca"` |
+| `certManager.clusterIssuer.letsencrypt.email` | nullOr str | `null` | required when `type = "letsencrypt*"` |
+| `certManager.clusterIssuer.letsencrypt.solver.type` | enum | `http01` | http01 only (dns01 deferred) |
+| `certManager.clusterIssuer.letsencrypt.solver.http01.ingressClass` | str | `traefik` | ingress class for the http01 solver |
+| `certManager.caSecret.enable` | bool | `false` | opt in to the on-target CA Secret loader |
+| `certManager.caSecret.name` | str | `ca-key-pair` | Kubernetes Secret name |
+| `certManager.caSecret.certPath` | str | `/var/lib/cert-manager/ca.crt` | path on target |
+| `certManager.caSecret.keyPath` | str | `/var/lib/cert-manager/ca.key` | path on target |
 
 Per-LC overrides and one-off `networking.*` tweaks still work — set
 them directly via `extraModules`, module merging picks them up over
 the values produced by `tenant.nix`.
+
+### Ingress controller (required only for ACME http01)
+
+The bundle does **not** ship an ingress controller. Two ClusterIssuer
+types work without one (`selfSigned`, `ca`); the two ACME types
+(`letsencryptStaging`, `letsencryptProd`) need an ingress controller
+matching `letsencrypt.solver.http01.ingressClass`. Install one of:
+
+```bash
+# Option A: Traefik v3 (matches the default
+# letsencrypt.solver.http01.ingressClass = "traefik")
+helm repo add traefik https://traefik.github.io/charts
+helm install traefik traefik/traefik -n ingress-system --create-namespace
+
+# Option B: ingress-nginx (set
+# letsencrypt.solver.http01.ingressClass = "nginx" to match)
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm install ingress-nginx ingress-nginx/ingress-nginx -n ingress-system --create-namespace
+```
+
+### CA materials for `type = "ca"`
+
+The CA's `tls.crt` and `tls.key` are **never** read by Nix — they
+arrive on the target machine out-of-band and are kubectl-applied by
+`cert-manager-ca-secret.service` at boot. Three staging mechanisms:
+
+- **Fresh deploy**: `nixos-anywhere --extra-files <dir>` where `<dir>`
+  mirrors `/var/lib/cert-manager/ca.{crt,key}` on the target.
+- **Incremental update**: `scp` the files, then
+  `systemctl restart cert-manager-ca-secret.service`.
+- **Production**: encrypt at rest with `agenix` / `sops-nix` and point
+  `caSecret.certPath` / `keyPath` at the decrypted tmpfs paths.
+
+See [`examples/static-network/secrets/README.md`](./examples/static-network/secrets/README.md)
+for copy-pasteable commands.
 
 ## In-repo reference deployment (`soctalk` host)
 
@@ -133,6 +187,7 @@ The four files most likely to need editing:
 | Authorized SSH keys (in-repo default) | `config/ssh-keys.nix` |
 | Admin usernames (in-repo default) | `config/users.nix` |
 | Hostname / IP / gateway / DNS / timezone / locale / disk | `hosts/soctalk/tenant.nix` |
+| cert-manager version | `soctalk.tenant.certManager.version` in `hosts/soctalk/tenant.nix` (or chart-version default in `modules/cert-manager.nix`) |
 | Cilium values | `cilium/values.yaml` (+ `spec.version` in `modules/k3s.nix`) |
 
 Other dials:
@@ -264,7 +319,8 @@ modules/
   tenant.nix                    options + translation for soctalk.tenant.*
   users.nix                     creates users from tenant options
   k3s.nix                       K3s + Cilium manifest + firewall
-  kubectl-tooling.nix           CLI tools + KUBECONFIG + k alias
+  cert-manager.nix              cert-manager HelmChart + ClusterIssuer + CA Secret loader
+  kubectl-tooling.nix           CLI tools (kubectl + helm + k9s + cilium-cli + hubble + cmctl) + KUBECONFIG + k alias
   platforms/
     proxmox.nix                 qemu-guest, virtio, GRUB BIOS
     README.md                   extension guide
@@ -282,7 +338,8 @@ hosts/
 examples/
   README.md                     index
   minimal/                      smallest consumer flake
-  static-network/               full tenant override
+  static-network/               full tenant override + cert-manager CA ClusterIssuer + caSecret loader
+    secrets/                    .gitignore + README; consumer-supplied ca.{crt,key} live here
   dhcp/                         tenant with DHCP
 
 scripts/

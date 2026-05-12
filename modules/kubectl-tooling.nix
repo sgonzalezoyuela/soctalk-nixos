@@ -9,6 +9,7 @@
       unstable.k9s
       unstable.cilium-cli
       unstable.hubble
+      unstable.cmctl       # cert-manager CLI: `cmctl check api`, etc.
     ];
 
     # World-readable kubeconfig is set up by K3s with

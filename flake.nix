@@ -55,6 +55,7 @@
           ./modules/tenant.nix
           ./modules/users.nix
           ./modules/k3s.nix
+          ./modules/cert-manager.nix
           ./modules/kubectl-tooling.nix
           ./modules/platforms/proxmox.nix
           ./disko/single-disk-bios.nix
