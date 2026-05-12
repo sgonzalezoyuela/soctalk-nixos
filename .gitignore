@@ -1,0 +1,16 @@
+# Nix build outputs
+result
+result-*
+
+# direnv
+.direnv/
+
+# Disk artifacts (from local VM testing)
+*.qcow2
+*.raw
+*.vmdk
+
+# Editor
+*.swp
+*.swo
+.DS_Store
