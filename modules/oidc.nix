@@ -212,7 +212,9 @@ in
         default = "/var/lib/oauth2-proxy/cookie-secret";
         description = ''
           Path on target containing the 32-byte base64 cookie
-          secret. Generate with `openssl rand -base64 32`.
+          secret. If `cookieSecret.autoGenerate = true` (default)
+          and this file doesn't exist at boot, the loader mints
+          one with `openssl rand -base64 32 | tr -d '\n'`.
         '';
       };
 
@@ -223,6 +225,30 @@ in
           Name of the Kubernetes Secret the loader applies. Must
           match the chart's `config.existingSecret` (which we wire
           automatically).
+        '';
+      };
+    };
+
+    cookieSecret = {
+      autoGenerate = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          If true (default), the systemd loader mints a fresh
+          cookie-secret at `secretsPath.cookieSecret` if no file
+          exists there. The cookie-secret is 32 bytes of local
+          randomness used to sign session cookies — it never leaves
+          the cluster, so on-target generation is safe.
+
+          The generated file persists across reboots; sessions
+          remain valid until the file is deleted or replaced.
+
+          Set to false to require the consumer to stage the
+          cookie-secret explicitly (matches client-id /
+          client-secret behaviour). Useful when the cookie-secret is
+          managed externally — e.g., decrypted from agenix /
+          sops-nix into a tmpfs path that must be predictable across
+          reboots.
         '';
       };
     };
@@ -419,12 +445,21 @@ in
 
     # 4. Secrets loader. Same pattern as cert-manager-ca-secret.service —
     # bytes never enter /nix/store.
+    #
+    # Failure model:
+    #   - client-id / client-secret: must be staged by the consumer.
+    #     These come from the OIDC IdP and the loader can't invent them.
+    #     Missing → unit fails loudly with a clear message.
+    #   - cookie-secret: 32 bytes of local randomness. If the file is
+    #     missing, the loader mints it on first run (configurable via
+    #     `cookieSecret.autoGenerate`). Once written it persists across
+    #     reboots; rotating it invalidates existing sessions.
     systemd.services.oauth2-proxy-secrets = {
       description = "Load OAuth2-Proxy credentials Secret into the OIDC namespace.";
       wants = [ "k3s.service" "network-online.target" ];
       after = [ "k3s.service" "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
-      path = [ pkgs.kubectl pkgs.coreutils ];
+      path = [ pkgs.kubectl pkgs.coreutils pkgs.openssl ];
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
@@ -435,14 +470,32 @@ in
         set -euo pipefail
         export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
-        for f in ${cfg.secretsPath.clientId} ${cfg.secretsPath.clientSecret} ${cfg.secretsPath.cookieSecret}; do
+        # IdP-provided files: consumer must stage these.
+        for f in ${cfg.secretsPath.clientId} ${cfg.secretsPath.clientSecret}; do
           if [ ! -s "$f" ]; then
-            echo "oauth2-proxy-secrets: required file missing or empty: $f" >&2
-            echo "Stage credentials via nixos-anywhere --extra-files," >&2
-            echo "scp, or an at-rest-encrypted secrets backend (agenix/sops-nix)." >&2
+            echo "oauth2-proxy-secrets: required IdP credential missing or empty: $f" >&2
+            echo "Stage client-id and client-secret on the target via" >&2
+            echo "nixos-anywhere --extra-files / scp / agenix / sops-nix." >&2
             exit 1
           fi
         done
+
+        # cookie-secret: local random. Mint one on first run if missing
+        # and autoGenerate is enabled (default).
+        if [ ! -s ${cfg.secretsPath.cookieSecret} ]; then
+          ${if cfg.cookieSecret.autoGenerate then ''
+            install -d -m 0700 "$(dirname ${cfg.secretsPath.cookieSecret})"
+            umask 0277
+            openssl rand -base64 32 | tr -d '\n' > ${cfg.secretsPath.cookieSecret}
+            chmod 0400 ${cfg.secretsPath.cookieSecret}
+            echo "oauth2-proxy-secrets: generated new cookie-secret at ${cfg.secretsPath.cookieSecret}" >&2
+          '' else ''
+            echo "oauth2-proxy-secrets: cookie-secret missing or empty: ${cfg.secretsPath.cookieSecret}" >&2
+            echo "Generate with: openssl rand -base64 32 | tr -d '\\n' > ${cfg.secretsPath.cookieSecret}" >&2
+            echo "Or set soctalk.tenant.oidc.cookieSecret.autoGenerate = true." >&2
+            exit 1
+          ''}
+        fi
 
         until kubectl get --raw=/readyz >/dev/null 2>&1; do
           sleep 2

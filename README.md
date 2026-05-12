@@ -137,6 +137,7 @@ All knobs live under `soctalk.tenant.*`. Full schema in
 | `oidc.extraArgs` | attrs | `{}` | extra OAuth2-Proxy CLI flags; merged after defaults |
 | `oidc.secretsPath.{clientId,clientSecret,cookieSecret}` | str | `/var/lib/oauth2-proxy/...` | on-target paths read by the loader |
 | `oidc.secretsPath.secretName` | str | `oauth2-proxy-secrets` | k8s Secret name |
+| `oidc.cookieSecret.autoGenerate` | bool | `true` | mint cookie-secret on first boot if missing |
 | `oidc.ingress.enable` | bool | `true` | render `/oauth2/*` Ingress |
 | `oidc.ingress.className` | str | `traefik` | must match installed ingress controller |
 | `oidc.ingress.path` | str | `/oauth2` | Ingress path prefix |
@@ -183,18 +184,18 @@ Default behaviour:
   `clusterIssuer.enable = true` or set `tls.issuerRef` directly) to
   get a cert-manager-minted TLS Secret wired into the Ingress.
 
-Credentials (`client-id`, `client-secret`, `cookie-secret`) are
-loaded by `oauth2-proxy-secrets.service` at boot from
+Credentials are loaded by `oauth2-proxy-secrets.service` at boot from
 `/var/lib/oauth2-proxy/{client-id,client-secret,cookie-secret}` —
-the bytes never enter `/nix/store`. Stage them via
-`nixos-anywhere --extra-files`, `scp`, or `agenix` / `sops-nix`
-(see [`examples/oidc/secrets/README.md`](./examples/oidc/secrets/README.md)).
+the bytes never enter `/nix/store`.
 
-Generate the cookie-secret (the `tr -d '\n'` is required — OAuth2-Proxy rejects values that aren't exactly 32 raw bytes, and `openssl` appends a trailing newline):
-
-```bash
-openssl rand -base64 32 | tr -d '\n' > cookie-secret
-```
+- `client-id` and `client-secret` come from your IdP. Stage them via
+  `nixos-anywhere --extra-files`, `scp`, or `agenix` / `sops-nix`
+  (see [`examples/oidc/secrets/README.md`](./examples/oidc/secrets/README.md)).
+- `cookie-secret` is **auto-generated on first boot** by default
+  (`cookieSecret.autoGenerate = true`) — 32 bytes of local random,
+  persisted at `/var/lib/oauth2-proxy/cookie-secret` with mode 0400.
+  Disable auto-generation when you want to pin / rotate it via your
+  own secrets backend.
 
 Then protect any app's Ingress with the auth-url annotations. For
 **ingress-nginx**:
