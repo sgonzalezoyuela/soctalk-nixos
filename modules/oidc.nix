@@ -211,10 +211,17 @@ in
         type = lib.types.str;
         default = "/var/lib/oauth2-proxy/cookie-secret";
         description = ''
-          Path on target containing the 32-byte base64 cookie
-          secret. If `cookieSecret.autoGenerate = true` (default)
-          and this file doesn't exist at boot, the loader mints
-          one with `openssl rand -base64 32 | tr -d '\n'`.
+          Path on target containing the cookie secret. File contents
+          must be EXACTLY 16, 24, or 32 bytes — OAuth2-Proxy uses it
+          directly as an AES key and rejects other lengths.
+
+          If `cookieSecret.autoGenerate = true` (default) and this
+          file doesn't exist at boot, the loader mints a 32-byte
+          value with `openssl rand -base64 32 | head -c 32` (the
+          OAuth2-Proxy upstream recipe).
+
+          The loader also validates the length of any pre-staged
+          file and fails clearly if it isn't 16 / 24 / 32 bytes.
         '';
       };
 
@@ -482,20 +489,48 @@ in
 
         # cookie-secret: local random. Mint one on first run if missing
         # and autoGenerate is enabled (default).
+        #
+        # The value must be EXACTLY 16, 24, or 32 bytes — OAuth2-Proxy
+        # uses it directly as an AES key and rejects other lengths
+        # with `cookie_secret must be 16, 24, or 32 bytes to create
+        # an AES cipher, but is N bytes`. We use 32 bytes (AES-256).
+        #
+        # `openssl rand -base64 32` outputs 44 base64 chars (the
+        # encoding of 32 raw bytes). `head -c 32` takes the first 32
+        # of those ASCII chars — itself a 32-byte string, valid as an
+        # AES-256 key, and safe to use in environment variables /
+        # Kubernetes Secret values without further escaping. This is
+        # the recipe documented by OAuth2-Proxy upstream.
         if [ ! -s ${cfg.secretsPath.cookieSecret} ]; then
           ${if cfg.cookieSecret.autoGenerate then ''
             install -d -m 0700 "$(dirname ${cfg.secretsPath.cookieSecret})"
             umask 0277
-            openssl rand -base64 32 | tr -d '\n' > ${cfg.secretsPath.cookieSecret}
+            openssl rand -base64 32 | head -c 32 > ${cfg.secretsPath.cookieSecret}
             chmod 0400 ${cfg.secretsPath.cookieSecret}
-            echo "oauth2-proxy-secrets: generated new cookie-secret at ${cfg.secretsPath.cookieSecret}" >&2
+            echo "oauth2-proxy-secrets: generated new 32-byte cookie-secret at ${cfg.secretsPath.cookieSecret}" >&2
           '' else ''
             echo "oauth2-proxy-secrets: cookie-secret missing or empty: ${cfg.secretsPath.cookieSecret}" >&2
-            echo "Generate with: openssl rand -base64 32 | tr -d '\\n' > ${cfg.secretsPath.cookieSecret}" >&2
+            echo "Generate with: openssl rand -base64 32 | head -c 32 > ${cfg.secretsPath.cookieSecret}" >&2
+            echo "(Must be exactly 16, 24, or 32 bytes — AES key size.)" >&2
             echo "Or set soctalk.tenant.oidc.cookieSecret.autoGenerate = true." >&2
             exit 1
           ''}
         fi
+
+        # Defensive: validate any pre-staged cookie-secret length.
+        # Catches the most common consumer slip (using
+        # `openssl rand -base64 32` without truncating, which yields
+        # 44 bytes and breaks OAuth2-Proxy at startup).
+        cookie_secret_len=$(wc -c < ${cfg.secretsPath.cookieSecret})
+        case "$cookie_secret_len" in
+          16|24|32) : ;;
+          *)
+            echo "oauth2-proxy-secrets: cookie-secret at ${cfg.secretsPath.cookieSecret} is $cookie_secret_len bytes; must be 16, 24, or 32." >&2
+            echo "Common cause: \`openssl rand -base64 32\` produces 44 base64 chars (with a trailing newline)." >&2
+            echo "Use \`openssl rand -base64 32 | head -c 32\` (the OAuth2-Proxy upstream recipe)." >&2
+            exit 1
+            ;;
+        esac
 
         until kubectl get --raw=/readyz >/dev/null 2>&1; do
           sleep 2

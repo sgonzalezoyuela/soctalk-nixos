@@ -195,7 +195,10 @@ the bytes never enter `/nix/store`.
   (`cookieSecret.autoGenerate = true`) — 32 bytes of local random,
   persisted at `/var/lib/oauth2-proxy/cookie-secret` with mode 0400.
   Disable auto-generation when you want to pin / rotate it via your
-  own secrets backend.
+  own secrets backend. The value must be exactly 16, 24, or 32 bytes
+  — OAuth2-Proxy uses it directly as an AES key. The loader
+  validates the length of any pre-staged file and fails clearly if
+  it isn't.
 
 Then protect any app's Ingress with the auth-url annotations. For
 **ingress-nginx**:

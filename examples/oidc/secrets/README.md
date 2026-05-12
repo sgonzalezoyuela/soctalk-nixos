@@ -41,13 +41,24 @@ skip this step unless you want to:
 To generate one manually:
 
 ```bash
-openssl rand -base64 32 | tr -d '\n' > cookie-secret
+openssl rand -base64 32 | head -c 32 > cookie-secret
 chmod 0400 cookie-secret
 ```
 
-The `tr -d '\n'` strips the trailing newline that `openssl` appends —
-without it, OAuth2-Proxy rejects the cookie secret as "not exactly
-32 bytes" because the trailing `\n` makes the decoded value 33 bytes.
+**The `| head -c 32` is required.** OAuth2-Proxy uses the file
+content directly as an AES key and only accepts values that are
+exactly 16, 24, or 32 bytes. `openssl rand -base64 32` alone
+produces 44 base64 characters + a trailing newline (45 bytes total),
+which OAuth2-Proxy rejects at startup with:
+
+```
+cookie_secret must be 16, 24, or 32 bytes to create an AES cipher, but is N bytes
+```
+
+`head -c 32` keeps only the first 32 ASCII characters of the base64
+output — itself a 32-byte string, valid as an AES-256 key, and safe
+in environment variables / Kubernetes Secret values. This is the
+recipe OAuth2-Proxy upstream documents.
 
 The cookie secret is cluster-local — never visible to clients. Rotate
 it during incident response; existing sessions are invalidated.
