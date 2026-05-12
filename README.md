@@ -41,7 +41,7 @@ In your own flake:
 ```nix
 {
   inputs = {
-    soctalk-nixos.url = "github:atricore/soctalk-nixos";
+    soctalk-nixos.url = "github:sgonzalezoyuela/soctalk-nixos";
     nixpkgs.follows   = "soctalk-nixos/nixpkgs";
   };
 
@@ -52,8 +52,8 @@ In your own flake:
         timeZone = "Europe/Madrid";
         locale   = "es_ES.UTF-8";
 
-        adminUsers        = [ { name = "ops"; description = "Ops admin"; } ];
-        sshAuthorizedKeys = [ "ssh-ed25519 AAAA... ops@laptop" ];
+        adminUsers        = [ { name = "soctalk"; description = "Soctalk Ops admin"; } ];
+        sshAuthorizedKeys = [ "ssh-ed25519 AAAA... soctalk@desk001" ];
 
         network = {
           interface     = "ens18";
