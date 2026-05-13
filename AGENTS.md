@@ -233,12 +233,12 @@ Declared in `modules/tenant.nix`. Full schema:
 | `oidc.tls.secretName` | str | `"oauth2-proxy-tls"` | Secret holding the TLS cert |
 | `oidc.tls.issuerRef` | nullOr str | = `clusterIssuer.name` when enabled, else `null` | ClusterIssuer the Certificate references |
 | `system.enable` | bool | `false` | gates the soctalk-system stack (HelmChart + Cert + Namespace) |
-| `system.chartRef` | str | `"oci://ghcr.io/gbrigandi/charts/soctalk-system"` | OCI chart URL |
+| `system.chartRef` | str | `"oci://ghcr.io/soctalk/charts/soctalk-system"` | OCI chart URL |
 | `system.version` | str | `"0.1.0"` | chart version (0.x — expect breakage) |
 | `system.namespace` | str | `"soctalk-system"` | install namespace |
 | `system.install.msspId` / `msspName` / `installId` | nullOr str / nullOr str / nullOr str | `null` / `null` / `null` | identity triple; all REQUIRED when `system.enable` |
 | `system.install.installLabel` | str | `"production"` | human label |
-| `system.image.{registry,tag}` | str / nullOr str | `"ghcr.io/gbrigandi"` / `null` | image overrides; `tag = null` ⇒ sparse-rendered (omitted from values) |
+| `system.image.{registry,tag}` | str / nullOr str | `"ghcr.io/soctalk"` / `null` | image overrides; `tag = null` ⇒ sparse-rendered (omitted from values) |
 | `system.ingress.{enable,className}` | bool / str | `true` / `"traefik"` | render Ingress + ingress class |
 | `system.ingress.hostnames.{mssp,customer}` | nullOr str | `null` / `null` | both REQUIRED when `ingress.enable`; `customer` may be a wildcard pattern |
 | `system.tls.{enable,secretName}` | bool / str | `false` / `"soctalk-tls"` | optional Certificate + secret name |
@@ -896,7 +896,7 @@ same opt-in pattern as `oidc.*`.
 | Manifest / behaviour | Always present when enable=true | Notes |
 |---|---|---|
 | `soctalk-system-namespace` | yes | Pre-creates the namespace alphabetically before the chart, same race-tightening rationale as cert-manager / OAuth2-Proxy |
-| `soctalk-system` HelmChart | yes | Non-bootstrap. OCI chart reference (`oci://ghcr.io/gbrigandi/charts/soctalk-system`) |
+| `soctalk-system` HelmChart | yes | Non-bootstrap. OCI chart reference (`oci://ghcr.io/soctalk/charts/soctalk-system`) |
 | `soctalk-system-cert` Certificate | gated on `tls.enable` (default false) | Mints `tls.secretName` into the soctalk-system namespace |
 | `config.warnings` entry | gated on `system.enable && !oidc.enable` | NixOS-level warning, not an assertion |
 
@@ -985,7 +985,7 @@ The chart is at `0.1.0` as of this writing. 0.x versions break
 freely. When bumping:
 
 1. Diff `values.yaml` between the two versions
-   (`helm show values oci://ghcr.io/gbrigandi/charts/soctalk-system --version <new>`).
+   (`helm show values oci://ghcr.io/soctalk/charts/soctalk-system --version <new>`).
 2. Add / rename / remove options in `modules/soctalk.nix` to match.
 3. Test on a throwaway VM with the full-stack example.
 4. Verify the chart's pre-install Job passes its checks (it runs as

@@ -36,7 +36,7 @@ configuration was validated end-to-end.
   ingress auth-url annotations.
 - **Optional `soctalk-system` (the apex application)** — installed
   when `system.enable = true`. Pulls the chart from
-  `oci://ghcr.io/gbrigandi/charts/soctalk-system`, wires the MSSP /
+  `oci://ghcr.io/soctalk/charts/soctalk-system`, wires the MSSP /
   install identity, the public hostnames (`mssp.<domain>` and
   `*.customers.<domain>`), the OIDC trusted-header config consumed
   downstream, and (opt-in) a cert-manager Certificate for the
@@ -153,12 +153,12 @@ All knobs live under `soctalk.tenant.*`. Full schema in
 | `oidc.tls.secretName` | str | `oauth2-proxy-tls` | TLS Secret |
 | `oidc.tls.issuerRef` | nullOr str | `clusterIssuer.name` when enabled, else `null` | ClusterIssuer the Certificate references |
 | `system.enable` | bool | `false` | install the soctalk-system stack |
-| `system.chartRef` | str | `oci://ghcr.io/gbrigandi/charts/soctalk-system` | OCI Helm chart |
+| `system.chartRef` | str | `oci://ghcr.io/soctalk/charts/soctalk-system` | OCI Helm chart |
 | `system.version` | str | `0.1.0` | chart version (0.x — expect breakage) |
 | `system.namespace` | str | `soctalk-system` | install namespace |
 | `system.install.{msspId,msspName,installId}` | nullOr str | `null` | identity triple; REQUIRED when enable |
 | `system.install.installLabel` | str | `production` | human label |
-| `system.image.registry` | str | `ghcr.io/gbrigandi` | image registry override |
+| `system.image.registry` | str | `ghcr.io/soctalk | image registry override |
 | `system.image.tag` | nullOr str | `null` | sparse: omitted from values when null (chart default wins) |
 | `system.ingress.enable` | bool | `true` | render Ingress |
 | `system.ingress.className` | str | `traefik` | ingress class |
@@ -293,7 +293,7 @@ system = {
 };
 ```
 
-The chart pulls from `oci://ghcr.io/gbrigandi/charts/soctalk-system`
+The chart pulls from `oci://ghcr.io/soctalk/charts/soctalk-system`
 v `0.1.0`. K3s' helm-controller handles OCI charts natively.
 
 #### Wildcard certificate

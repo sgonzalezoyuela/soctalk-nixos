@@ -40,7 +40,7 @@ SocTalk install — every other example is a strict subset.
 
 | | |
 |---|---|
-| Chart | `oci://ghcr.io/gbrigandi/charts/soctalk-system` v `0.1.0` |
+| Chart | `oci://ghcr.io/soctalk/charts/soctalk-system` v `0.1.0` |
 | MSSP UUID | `11111111-…` — **replace** with your real UUID (`uuidgen \| tr A-Z a-z`) |
 | MSSP name | `Acme Security` — **replace** |
 | Install UUID | `22222222-…` — **replace** |

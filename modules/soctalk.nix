@@ -3,7 +3,7 @@
 #
 # Opt-in (soctalk.tenant.system.enable = false by default). When
 # enabled, installs the soctalk-system Helm chart from its OCI registry
-# (ghcr.io/gbrigandi/charts), wires the consumer's identity / hostname
+# (ghcr.io/soctalk/charts), wires the consumer's identity / hostname
 # / TLS / OIDC settings, and optionally renders a cert-manager
 # Certificate for the rendered Ingress.
 #
@@ -89,7 +89,7 @@ in
 
     chartRef = lib.mkOption {
       type = lib.types.str;
-      default = "oci://ghcr.io/gbrigandi/charts/soctalk-system";
+      default = "oci://ghcr.io/soctalk/charts/soctalk-system";
       description = ''
         Helm chart reference. Defaults to the official OCI registry.
         K3s' helm-controller (klipper-helm) recognises `oci://` URLs
@@ -154,7 +154,7 @@ in
     image = {
       registry = lib.mkOption {
         type = lib.types.str;
-        default = "ghcr.io/gbrigandi";
+        default = "ghcr.io/soctalk";
         description = "Container image registry prefix. Override for air-gapped / mirror deployments.";
       };
 
