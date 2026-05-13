@@ -57,6 +57,7 @@
           ./modules/k3s.nix
           ./modules/cert-manager.nix
           ./modules/oidc.nix
+          ./modules/soctalk.nix
           ./modules/kubectl-tooling.nix
           ./modules/platforms/proxmox.nix
           ./disko/single-disk-bios.nix

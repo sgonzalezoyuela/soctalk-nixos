@@ -34,6 +34,14 @@ configuration was validated end-to-end.
   (never `/nix/store`), an Ingress for the `/oauth2/*` paths, and
   optional cert-manager-minted TLS. Apps protect themselves with
   ingress auth-url annotations.
+- **Optional `soctalk-system` (the apex application)** — installed
+  when `system.enable = true`. Pulls the chart from
+  `oci://ghcr.io/gbrigandi/charts/soctalk-system`, wires the MSSP /
+  install identity, the public hostnames (`mssp.<domain>` and
+  `*.customers.<domain>`), the OIDC trusted-header config consumed
+  downstream, and (opt-in) a cert-manager Certificate for the
+  ingress's TLS. PostgreSQL is bundled and provisioned on
+  local-path-provisioner.
 - kubectl + kubernetes-helm + kubecolor + k9s + cilium-cli + hubble + cmctl
   on the host
 - System-wide `k = kubecolor` alias with kubectl completion bound to
@@ -144,6 +152,25 @@ All knobs live under `soctalk.tenant.*`. Full schema in
 | `oidc.tls.enable` | bool | `false` | render cert-manager Certificate + Ingress TLS block |
 | `oidc.tls.secretName` | str | `oauth2-proxy-tls` | TLS Secret |
 | `oidc.tls.issuerRef` | nullOr str | `clusterIssuer.name` when enabled, else `null` | ClusterIssuer the Certificate references |
+| `system.enable` | bool | `false` | install the soctalk-system stack |
+| `system.chartRef` | str | `oci://ghcr.io/gbrigandi/charts/soctalk-system` | OCI Helm chart |
+| `system.version` | str | `0.1.0` | chart version (0.x — expect breakage) |
+| `system.namespace` | str | `soctalk-system` | install namespace |
+| `system.install.{msspId,msspName,installId}` | nullOr str | `null` | identity triple; REQUIRED when enable |
+| `system.install.installLabel` | str | `production` | human label |
+| `system.image.registry` | str | `ghcr.io/gbrigandi` | image registry override |
+| `system.image.tag` | nullOr str | `null` | sparse: omitted from values when null (chart default wins) |
+| `system.ingress.enable` | bool | `true` | render Ingress |
+| `system.ingress.className` | str | `traefik` | ingress class |
+| `system.ingress.hostnames.{mssp,customer}` | nullOr str | `null` | both REQUIRED when ingress.enable; `customer` may be a wildcard |
+| `system.tls.enable` | bool | `false` | render cert-manager Certificate + Ingress TLS block |
+| `system.tls.secretName` | str | `soctalk-tls` | TLS Secret name |
+| `system.tls.issuerRef` | nullOr str | `clusterIssuer.name` when enabled, else `null` | ClusterIssuer the Certificate references |
+| `system.tls.includeWildcard` | bool | `false` | include `hostnames.customer` (wildcard) in Certificate dnsNames; needs DNS-01 issuer |
+| `system.oidc.{trustedHeaderUser,trustedHeaderEmail}` | str | `X-Auth-Request-{User,Email}` | trusted identity headers |
+| `system.oidc.trustedProxyCIDRs` | listOf str | `[10.42.0.0/16]` | CIDRs trusted to set those headers |
+| `system.postgres.enable` | bool | `true` | bundled Postgres |
+| `system.postgres.storage.size` | str | `20Gi` | Postgres PVC size |
 
 Per-LC overrides and one-off `networking.*` tweaks still work — set
 them directly via `extraModules`, module merging picks them up over
@@ -231,6 +258,71 @@ Then reference the Middleware on the protected app's Ingress via
 `traefik.ingress.kubernetes.io/router.middlewares`.
 
 See [`examples/oidc/`](./examples/oidc) for the full end-to-end flake.
+
+### SocTalk-system (the apex application)
+
+`soctalk-system` is the application this whole project supports. Set
+`soctalk.tenant.system.enable = true` plus the required identity
+fields:
+
+```nix
+system = {
+  enable = true;
+
+  install = {
+    msspId = "11111111-…";   # uuidgen | tr A-Z a-z
+    msspName = "Acme Security";
+    installId = "22222222-…";  # uuidgen | tr A-Z a-z
+    installLabel = "pilot-prod";
+  };
+
+  ingress = {
+    className = "traefik";          # match installed ingress controller
+    hostnames = {
+      mssp = "mssp.example.org";
+      customer = "*.customers.example.org";
+    };
+  };
+
+  tls.enable = true;                # mint MSSP-host cert via cert-manager
+  # tls.issuerRef defaults to clusterIssuer.name when enabled.
+  # tls.includeWildcard = false (default) — wildcard customer cert is
+  # consumer-owned (Let's Encrypt http01 cannot issue wildcards).
+
+  postgres.storage.size = "20Gi";
+};
+```
+
+The chart pulls from `oci://ghcr.io/gbrigandi/charts/soctalk-system`
+v `0.1.0`. K3s' helm-controller handles OCI charts natively.
+
+#### Wildcard certificate
+
+The `*.customers.<domain>` hostname needs a wildcard TLS cert, which
+Let's Encrypt http01 (and our internal CA setup) cannot issue. The
+rendered Certificate covers only the `mssp.*` hostname by default
+(`tls.includeWildcard = false`). For the customer hostname:
+
+1. Provide the wildcard cert as a Secret named `soctalk-tls` (or
+   change `system.tls.secretName`).
+2. Or wire a DNS-01-capable Issuer (Cloudflare / Route 53 / etc.) and
+   set `tls.includeWildcard = true` so both hostnames are in the
+   Certificate's `dnsNames`.
+
+#### OIDC dependency
+
+`system.enable` + `oidc.enable` is the production-shape combination:
+OAuth2-Proxy injects `X-Auth-Request-{User,Email}` headers that
+SocTalk reads. Enabling `system.*` without `oidc.*` emits a NixOS
+**warning** (not a hard failure) — a consumer may be providing the
+trusted-header injection themselves (Authelia, Pomerium, custom Lua
+at the ingress, etc.).
+
+#### Full-stack example
+
+See [`examples/full-stack/`](./examples/full-stack) for the complete
+chain (cert-manager + ClusterIssuer + OAuth2-Proxy + SocTalk) in a
+single deployable consumer flake.
 
 ### CA materials for `type = "ca"`
 
@@ -411,6 +503,7 @@ modules/
   k3s.nix                       K3s + Cilium manifest + firewall
   cert-manager.nix              cert-manager HelmChart + ClusterIssuer + CA Secret loader
   oidc.nix                      OAuth2-Proxy HelmChart + Ingress + cert-manager Certificate + Secret loader
+  soctalk.nix                   soctalk-system HelmChart (OCI) + Certificate + soft warning when oidc disabled
   kubectl-tooling.nix           CLI tools (kubectl + helm + k9s + cilium-cli + hubble + cmctl) + KUBECONFIG + k alias
   platforms/
     proxmox.nix                 qemu-guest, virtio, GRUB BIOS
@@ -432,8 +525,8 @@ examples/
   static-network/               full tenant override + cert-manager CA ClusterIssuer + caSecret loader
     secrets/                    .gitignore + README; consumer-supplied ca.{crt,key} live here
   dhcp/                         tenant with DHCP
-  oidc/                         full stack: cert-manager + ClusterIssuer + OAuth2-Proxy + Ingress + TLS
-    secrets/                    .gitignore + README; ca + client-id/secret + cookie-secret live here
+  full-stack/                   K3s + Cilium + cert-manager + OAuth2-Proxy + soctalk-system end-to-end
+    secrets/                    .gitignore + README; ca + client-id/secret live here
 
 scripts/
   deploy.sh                     wrapper for `nix run .#deploy`

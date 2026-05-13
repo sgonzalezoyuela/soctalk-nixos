@@ -73,6 +73,7 @@ modules/
   k3s.nix               K3s server + declarative Cilium HelmChart + firewall
   cert-manager.nix      cert-manager HelmChart + optional ClusterIssuer + optional CA Secret loader
   oidc.nix              OAuth2-Proxy HelmChart + optional Ingress + optional cert-manager Certificate + Secret loader
+  soctalk.nix           soctalk-system HelmChart (OCI) + optional cert-manager Certificate + soft warning when oidc disabled
   kubectl-tooling.nix   kubectl + helm + k9s + cilium-cli + hubble + cmctl + completions
   platforms/
     proxmox.nix         qemu-guest profile + virtio drivers + GRUB BIOS
@@ -116,6 +117,7 @@ AGENTS.md               you are here
 - `./modules/k3s.nix`
 - `./modules/cert-manager.nix`
 - `./modules/oidc.nix`
+- `./modules/soctalk.nix`
 - `./modules/kubectl-tooling.nix`
 - `./modules/platforms/proxmox.nix`
 - `./disko/single-disk-bios.nix`
@@ -230,6 +232,21 @@ Declared in `modules/tenant.nix`. Full schema:
 | `oidc.tls.enable` | bool | `false` | render cert-manager Certificate + Ingress TLS block |
 | `oidc.tls.secretName` | str | `"oauth2-proxy-tls"` | Secret holding the TLS cert |
 | `oidc.tls.issuerRef` | nullOr str | = `clusterIssuer.name` when enabled, else `null` | ClusterIssuer the Certificate references |
+| `system.enable` | bool | `false` | gates the soctalk-system stack (HelmChart + Cert + Namespace) |
+| `system.chartRef` | str | `"oci://ghcr.io/gbrigandi/charts/soctalk-system"` | OCI chart URL |
+| `system.version` | str | `"0.1.0"` | chart version (0.x — expect breakage) |
+| `system.namespace` | str | `"soctalk-system"` | install namespace |
+| `system.install.msspId` / `msspName` / `installId` | nullOr str / nullOr str / nullOr str | `null` / `null` / `null` | identity triple; all REQUIRED when `system.enable` |
+| `system.install.installLabel` | str | `"production"` | human label |
+| `system.image.{registry,tag}` | str / nullOr str | `"ghcr.io/gbrigandi"` / `null` | image overrides; `tag = null` ⇒ sparse-rendered (omitted from values) |
+| `system.ingress.{enable,className}` | bool / str | `true` / `"traefik"` | render Ingress + ingress class |
+| `system.ingress.hostnames.{mssp,customer}` | nullOr str | `null` / `null` | both REQUIRED when `ingress.enable`; `customer` may be a wildcard pattern |
+| `system.tls.{enable,secretName}` | bool / str | `false` / `"soctalk-tls"` | optional Certificate + secret name |
+| `system.tls.issuerRef` | nullOr str | = `clusterIssuer.name` when enabled, else `null` | ClusterIssuer the Certificate references |
+| `system.tls.includeWildcard` | bool | `false` | when true, Certificate's dnsNames includes `hostnames.customer`; requires DNS-01 issuer |
+| `system.oidc.{trustedHeaderUser,trustedHeaderEmail}` | str / str | `"X-Auth-Request-User"` / `"X-Auth-Request-Email"` | headers SocTalk trusts as authenticated identity |
+| `system.oidc.trustedProxyCIDRs` | listOf str | `[ "10.42.0.0/16" ]` | CIDRs allowed to set those headers (K3s pod CIDR) |
+| `system.postgres.{enable,storage.size}` | bool / str | `true` / `"20Gi"` | bundled Postgres + PVC size |
 
 ### Assertions
 
@@ -245,6 +262,17 @@ Inside `modules/oidc.nix`:
 - `oidc.enable` ⇒ `issuerUrl != null`.
 - `oidc.enable` ⇒ `host != ""` (defensive — should be unreachable given the default).
 - `oidc.enable && tls.enable` ⇒ `tls.issuerRef != null`.
+
+Inside `modules/soctalk.nix`:
+- `system.enable` ⇒ `install.{msspId, msspName, installId}` all non-null.
+- `system.enable && ingress.enable` ⇒ `ingress.hostnames.{mssp, customer}` both non-null.
+- `system.enable && tls.enable` ⇒ `tls.issuerRef != null`.
+
+Soft warnings (via `config.warnings`, not assertions):
+- `system.enable && !oidc.enable` ⇒ NixOS prints a warning that
+  SocTalk won't see authenticated identity without an upstream auth
+  proxy. Doesn't block eval — a consumer may be injecting auth
+  headers from elsewhere.
 
 All fire at evaluation time via `config.assertions`. **Always add an
 assertion when you add an option that has cross-field validity
@@ -443,11 +471,28 @@ nix eval --impure --json --expr 'let c = (builtins.getFlake (toString /wa/soc/so
 }' | jq    # → all four: false
 
 # 11. OIDC example renders all four pieces; host derives correctly; redirect-url is the derived default.
-nix eval --json './examples/oidc#nixosConfigurations.edge-01.config.services.k3s.manifests.oauth2-proxy.content.spec.valuesContent' \
+nix eval --json './examples/full-stack#nixosConfigurations.edge-01.config.services.k3s.manifests.oauth2-proxy.content.spec.valuesContent' \
   | jq '. | fromjson | .extraArgs'   # contains "redirect-url" matching derived URL
 
-nix eval --raw './examples/oidc#nixosConfigurations.edge-01.config.soctalk.tenant.oidc.host'
+nix eval --raw './examples/full-stack#nixosConfigurations.edge-01.config.soctalk.tenant.oidc.host'
 # → "edge-01.example.org"
+
+# 12. soctalk-system: in-repo soctalk has no soctalk-system manifests (default disabled).
+nix eval --impure --json --expr 'let c = (builtins.getFlake (toString /wa/soc/soctalk-nixos)).nixosConfigurations.soctalk.config; in {
+  hasNamespace = c.services.k3s.manifests ? soctalk-system-namespace;
+  hasHelmChart = c.services.k3s.manifests ? soctalk-system;
+  hasCert      = c.services.k3s.manifests ? soctalk-system-cert;
+}' | jq    # all three: false
+
+# 13. full-stack example: HelmChart + Namespace + Cert all present;
+#     values match expectation; image.tag sparse-omitted by default.
+nix eval --json './examples/full-stack#nixosConfigurations.edge-01.config.services.k3s.manifests.soctalk-system.content.spec' \
+  | jq '{chart, version, "values.install": (.valuesContent | fromjson | .install), "values.image": (.valuesContent | fromjson | .image)}'
+#   expect: chart = oci://…, image only has "registry" (no "tag" key)
+
+# 14. soctalk-system Certificate dnsNames respects includeWildcard.
+nix eval --json './examples/full-stack#nixosConfigurations.edge-01.config.services.k3s.manifests.soctalk-system-cert.content.spec.dnsNames'
+#   default (includeWildcard=false): ["mssp.example.org"]
 ```
 
 If any value in (2) changes from a known-good snapshot without a
@@ -500,14 +545,17 @@ Four flakes under `examples/`:
 | `minimal/` | Defaults work: only the required `network.{address,gateway}` are set; everything else falls back. Validates the option-default path. |
 | `static-network/` | Every tenant option overridable: timezone, locale, disk, users, SSH keys, full networking, plus cert-manager with a CA ClusterIssuer + caSecret loader. Validates the full override surface and the cert-manager secret-loader path. |
 | `dhcp/` | The assertion-relaxation path when `useDHCP = true`. Validates that `address`/`gateway` correctly become optional. |
-| `oidc/` | End-to-end auth stack: cert-manager + ClusterIssuer + OAuth2-Proxy + Ingress + TLS via cert-manager. Validates the OIDC host derivation, the `redirectUrl` override, and the cert-manager → OIDC integration through `tls.issuerRef`. |
+| `full-stack/` | End-to-end production-shape stack: cert-manager + ClusterIssuer + OAuth2-Proxy + Ingress + TLS-via-cert-manager + soctalk-system itself (with its own Certificate, identity UUIDs, hostnames). Validates every cross-module integration (OIDC host derivation, `tls.issuerRef` auto-derive, soctalk's wildcard handling, sparse `image.tag` rendering). Renamed from `oidc/` after soctalk-system was wired in. |
 
-The fourth example (`oidc/`) is justified despite §13's "don't add a
-fourth" guidance because it's the **only** example that exercises
-the full cert-manager + Ingress + TLS chain end-to-end, plus a
-second on-target secret loader (`oauth2-proxy-secrets.service`). It
-catches regressions that `static-network/` alone can't — notably,
-the host-derivation logic and `tls.issuerRef` cross-module default.
+The fourth example (`full-stack/`) is justified despite §13's "don't
+add a fourth" guidance because it's the **only** example that
+exercises the full cert-manager + Ingress + TLS + auth + application
+chain end-to-end, plus two on-target secret loaders
+(`cert-manager-ca-secret.service`, `oauth2-proxy-secrets.service`).
+It catches regressions that the other three can't — notably the host
+derivation logic, `tls.issuerRef` cross-module default,
+`tls.includeWildcard` rendering, and `image.tag` sparse-vs-full
+behaviour.
 
 Conventions:
 - **Input style**: `inputs.soctalk-nixos.url = "path:../..";`. This
@@ -550,6 +598,10 @@ The README has the full prose; the AGENTS.md-relevant warnings:
   omits `bootstrap = true`. **Do not add it** — it would force
   cert-manager onto the host network and break the standard
   webhook / API path.
+- **OAuth2-Proxy and soctalk-system are also NOT bootstrap
+  HelmCharts.** Same reasoning: they run as normal workloads after
+  the CNI is up. Cilium is the only `bootstrap = true` HelmChart in
+  the bundle.
 - **`routingMode: native`** — `tunnel` (VXLAN) failed silently on
   single-node, with no drop counters anywhere. Native fixed it.
   **Do not flip back to tunnel** without re-validating end-to-end
@@ -596,7 +648,7 @@ based on `type`:
 | `letsencryptStaging` | ❌ | needs an ingress controller matching `letsencrypt.solver.http01.ingressClass` |
 | `letsencryptProd` | ❌ | same |
 
-The bundle does **not** ship an ingress controller. AGENTS.md §19
+The bundle does **not** ship an ingress controller. AGENTS.md §21
 says secrets backends are out of scope; the same logic applies here
 — ingress controllers are downstream concerns. If a
 consumer needs ACME http01, they install Traefik v3 or ingress-nginx
@@ -642,7 +694,7 @@ Three paths, in increasing production-readiness:
 | `agenix` / `sops-nix` | production; encrypted-at-rest in repo, decrypted at boot to a tmpfs path; point `certPath`/`keyPath` at that path |
 
 The bundle has no opinion on which one — it just expects the files
-to exist when the systemd unit runs. AGENTS.md §19 is explicit:
+to exist when the systemd unit runs. AGENTS.md §21 is explicit:
 **we provide a Secret loader, not a secrets backend.**
 
 ### Manifest-apply ordering
@@ -833,7 +885,114 @@ are structural duplicates: same wait loop, same `kubectl ... --dry-run | kubectl
 copy-paste a third time. Until then, keeping them separate avoids
 premature abstraction.
 
-## 17. When to bump nixpkgs-unstable
+## 17. soctalk-system design
+
+`modules/soctalk.nix` is the apex of the bundle: K3s, Cilium,
+cert-manager, and OAuth2-Proxy exist to support this. It follows the
+same opt-in pattern as `oidc.*`.
+
+### What `system.enable = true` produces
+
+| Manifest / behaviour | Always present when enable=true | Notes |
+|---|---|---|
+| `soctalk-system-namespace` | yes | Pre-creates the namespace alphabetically before the chart, same race-tightening rationale as cert-manager / OAuth2-Proxy |
+| `soctalk-system` HelmChart | yes | Non-bootstrap. OCI chart reference (`oci://ghcr.io/gbrigandi/charts/soctalk-system`) |
+| `soctalk-system-cert` Certificate | gated on `tls.enable` (default false) | Mints `tls.secretName` into the soctalk-system namespace |
+| `config.warnings` entry | gated on `system.enable && !oidc.enable` | NixOS-level warning, not an assertion |
+
+No systemd loader: the chart's pre-install Job verifies cluster
+prerequisites itself, and we don't need to feed it any on-disk
+secrets (PostgreSQL credentials are auto-generated by the subchart;
+OIDC trust is purely header-based and doesn't require a secret here).
+
+### OCI chart support
+
+K3s' helm-controller (klipper-helm ≥ 0.5) recognises `oci://` URLs
+natively. The HelmChart manifest sets `spec.chart` to the OCI URL
+and omits `spec.repo`. Helm 3.7+ (which klipper-helm wraps) does the
+OCI registry login + pull internally.
+
+If a future K3s release drops OCI support or changes the URL shape,
+this module's HelmChart spec is the only place that needs updating.
+
+### `tls.includeWildcard` and the wildcard customer hostname
+
+The chart accepts two ingress hostnames: `mssp` (typically
+`mssp.<domain>`) and `customer` (typically
+`*.customers.<domain>`). Let's Encrypt http01 — the only ACME solver
+path the bundle wires today — **cannot** issue wildcard
+certificates. Only DNS-01 can.
+
+`tls.includeWildcard = false` (default) renders a Certificate that
+covers only `hostnames.mssp`. The consumer is responsible for the
+wildcard customer cert via either:
+
+- A manually-managed `Secret` of the same name as `tls.secretName`
+  (overwriting the one cert-manager mints — last apply wins).
+- A separately-rendered Certificate referencing a DNS-01-capable
+  Issuer, via `extraModules`.
+
+Flipping `tls.includeWildcard = true` only makes sense when the
+configured ClusterIssuer can do DNS-01. With http01 it will sit in
+`Issuing` failed forever.
+
+### `image.tag` sparse rendering
+
+Unlike every other tenant-controlled value, `image.tag` is rendered
+**sparsely**: when the tenant doesn't set it (the `null` default),
+the `tag` key is omitted from the rendered Helm values entirely. The
+chart's built-in default tag (typically tracking the chart version)
+then wins.
+
+Rationale: image tags are tightly coupled to the chart version
+(every chart release pins a specific app image). Forcing a tag
+through the bundle would couple a consumer-flake upgrade to a
+soctalk-nixos upgrade — exactly what `extraArgs`-style escape
+hatches exist to avoid.
+
+### OIDC integration — soft dependency
+
+`system.oidc.{trustedHeaderUser, trustedHeaderEmail,
+trustedProxyCIDRs}` configures which headers SocTalk trusts as
+authenticated identity, and from which network ranges. Defaults
+align with OAuth2-Proxy's `--set-xauthrequest` output and the K3s
+pod CIDR (`10.42.0.0/16`).
+
+Enabling `system.enable` without `oidc.enable` emits a
+**`config.warnings` entry** but does not fail eval. The reason is
+that SocTalk only requires *some* upstream to set those headers —
+the bundle's OAuth2-Proxy is one option, but a consumer may have
+their own auth proxy (Authelia, Pomerium, custom Lua at the
+ingress) that injects the same headers.
+
+If you ever want this to be a hard dependency, swap the
+`config.warnings` entry for an `assertions` entry. The current
+soft-warning behaviour is documented in §6 assertions block.
+
+### Identity (msspId / installId)
+
+The two UUIDs are pinned by the chart's pre-install Job into a
+ConfigMap that drives in-cluster identity for the rest of the
+SocTalk control plane. **Treat them as stable per-installation
+constants** — changing them after first install will produce a new
+"installation" identity in the database and may orphan existing
+tenant data. Generate with `uuidgen | tr A-Z a-z` once, then pin in
+the consumer flake.
+
+### When to bump `system.version`
+
+The chart is at `0.1.0` as of this writing. 0.x versions break
+freely. When bumping:
+
+1. Diff `values.yaml` between the two versions
+   (`helm show values oci://ghcr.io/gbrigandi/charts/soctalk-system --version <new>`).
+2. Add / rename / remove options in `modules/soctalk.nix` to match.
+3. Test on a throwaway VM with the full-stack example.
+4. Verify the chart's pre-install Job passes its checks (it runs as
+   a Helm post-install hook and surfaces failures in
+   `kubectl -n soctalk-system get pods`).
+
+## 18. When to bump nixpkgs-unstable
 
 The overlay isolates `pkgs.unstable` from the rest of the system, so
 bumping it should only affect K3s + Cilium tooling. Bump when:
@@ -849,7 +1008,7 @@ regressions:
 nix build .#nixosConfigurations.soctalk.config.system.build.toplevel
 ```
 
-## 18. When to bump Cilium
+## 19. When to bump Cilium
 
 Change two things together:
 1. `cilium/values.yaml` — review release notes for value renames.
@@ -863,7 +1022,7 @@ After bumping:
 - Confirm a test pod can reach `kubernetes.default.svc` and the
   outside internet.
 
-## 19. Common pitfalls
+## 20. Common pitfalls
 
 | Pitfall | What happens | Avoid by |
 |---|---|---|
@@ -877,6 +1036,10 @@ After bumping:
 | Enabling `oidc.enable` without staging `/var/lib/oauth2-proxy/{client-id,client-secret}` | `oauth2-proxy-secrets.service` fails with "required IdP credential missing or empty"; OAuth2-Proxy CrashLoopBackOff with `Error: secret "oauth2-proxy-secrets" not found` | Stage `client-id` and `client-secret` via `--extra-files` / scp / agenix / sops-nix before deploy. `cookie-secret` is auto-generated by default (see `cookieSecret.autoGenerate` in §16) |
 | Setting `cookieSecret.autoGenerate = false` without explicitly staging `cookie-secret` | Loader fails with "cookie-secret missing or empty"; Pod CrashLoopBackOff | Either flip `autoGenerate` back to true, or `openssl rand -base64 32 \| head -c 32 > /var/lib/oauth2-proxy/cookie-secret && systemctl restart oauth2-proxy-secrets.service` |
 | Generating cookie-secret with `openssl rand -base64 32` (no `\| head -c 32`) | File is 44 chars + trailing newline = 45 bytes. OAuth2-Proxy fails at startup: `cookie_secret must be 16, 24, or 32 bytes to create an AES cipher, but is 45 bytes`. The chart's Secret reference is correct, the loader applied the Secret correctly — OAuth2-Proxy itself rejects the value | Use `openssl rand -base64 32 \| head -c 32`. The loader now validates length on its own and fails fast if the file isn't 16/24/32 bytes |
+| Enabling `system.enable` with `tls.includeWildcard = true` while the configured ClusterIssuer only does http01 | `Certificate` resource sits in `Issuing: false` forever; logs show "wildcard requested but http01 cannot satisfy" | Either flip `includeWildcard = false` and provide the wildcard cert externally, or wire a DNS-01-capable issuer and set `tls.issuerRef` to it |
+| Reusing the same `msspId` / `installId` across two SocTalk installs | Both clusters' control planes claim the same identity; downstream auth / multi-tenancy logic gets confused | Generate fresh UUIDs per installation with `uuidgen \| tr A-Z a-z`. Treat the UUIDs as stable per-installation constants |
+| Setting `system.image.tag` thinking it'll override the chart | Sparse-rendering means the *consumer* tag wins only when set; leaving the option at `null` lets the chart's app-version default apply | Verify with `nix eval --json … .services.k3s.manifests.soctalk-system.content.spec.valuesContent \| jq '. \| fromjson \| .image'` — if no `tag` key, the chart's default is used |
+| Mismatched `ingress.className` between `oidc.*`, `certManager.letsencrypt.solver.http01.*`, and `system.*` | One of the three Ingresses won't be picked up by your installed controller | Set all three to the same value (default: `traefik`). The bundle does not enforce alignment — it's the consumer's responsibility |
 | Default `oidc.ingress.className = "traefik"` mismatched with an installed `nginx` controller | `/oauth2/*` requests 404 — no controller picks up the Ingress | Set `oidc.ingress.className = "nginx"` (and consider aligning `letsencrypt.solver.http01.ingressClass` too) |
 | `oidc.host` mismatched with the IdP's registered redirect URI | OIDC callback fails after login with "invalid redirect_uri" | Either fix `oidc.host` / `oidc.redirectUrl` to match what's registered, or update the IdP client's authorized redirect URIs |
 | Setting `i18n.defaultLocale` in `modules/base.nix` | "conflicting definitions" with `modules/tenant.nix` | Only `modules/tenant.nix` sets it |
@@ -888,7 +1051,7 @@ After bumping:
 | Forgetting to `git add` before `nix flake check` | Stale evaluation against committed tree | Always `git add -A` before checking |
 | Not bumping example lockfiles after a root bump | Examples drift from upstream | Run `nix flake update` in each example dir after a root bump |
 
-## 20. What is intentionally NOT in scope
+## 21. What is intentionally NOT in scope
 
 - **Multi-platform in one flake.** The bundle hard-imports
   `modules/platforms/proxmox.nix`. To target EC2 or Hetzner, fork or
@@ -914,7 +1077,7 @@ If a request lands that looks like one of the above, push back: it
 probably belongs in a downstream consumer flake, not in this
 upstream.
 
-## 21. Provenance
+## 22. Provenance
 
 Lifted from `/wa/nix/mynix/hosts/soctalk/` after that cluster's
 configuration was validated end-to-end. The non-obvious choices in
